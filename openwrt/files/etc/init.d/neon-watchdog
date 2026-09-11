@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# Post-sysupgrade safety net, see /usr/sbin/neon-watchdog. Does nothing unless rollout.py armed it.
+START=99
+
+start() {
+	[ -s /etc/neon/watchdog ] || return 0
+	setsid /usr/sbin/neon-watchdog run </dev/null >/dev/null 2>&1 &
+}
+
+stop() {
+	return 0
+}

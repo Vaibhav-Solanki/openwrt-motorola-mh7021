@@ -1,0 +1,10 @@
+# Status light (see /usr/sbin/neon-led). `/etc/init.d/neon-led reload` after editing.
+config neon_led 'led'
+	option enabled '1'
+	option role 'auto'		# auto (router if a 'wan' interface exists) | router | satellite
+	option activity '0'		# 1: green flickers with WAN / mesh traffic (netdev trigger)
+	option weak_rssi '-75'		# satellite: green dips while the link towards the base averages below this (dBm, clears 5 dB higher); 0 = off
+	option grace '120'		# satellite: seconds of cyan "searching" before red "no backhaul"
+	option inet_hosts '1.1.1.1 8.8.8.8'
+	option probe_interval '10'	# seconds between ping rounds
+	option fails '3'		# failed rounds before internet/base count as down

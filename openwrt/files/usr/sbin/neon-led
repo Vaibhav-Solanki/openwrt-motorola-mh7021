@@ -1,0 +1,221 @@
+#!/bin/sh
+# neon-led -- drive the MH7021's RGB status light from the live network state.
+# The light is three GPIO LEDs (red/green/blue:status) behind one light pipe,
+# on/off only, so there are 7 colours x steady/blink. Started by
+# /etc/init.d/neon-led (START=97, after OpenWrt's own S96led); settings in
+# /etc/config/neon_led.
+#
+#   ROUTER (a 'wan' interface exists)      SATELLITE (no 'wan')
+#   red    steady  WAN port has no link    cyan   blink   searching for a mesh peer (grace period)
+#   yellow blink   link up, no address yet red    blink   no mesh peer after the grace period
+#   yellow steady  WAN up, no internet     cyan   steady  mesh peer up, base router unreachable
+#   green  steady  internet reachable      yellow steady  base reachable, no internet
+#                                          green  steady  all good  (short dip every 2 s = weak link towards the base)
+#   BOTH   blue steady    booted, this daemon not running (or stopping/rebooting)
+#          blue blink     early boot (OpenWrt preinit)
+#          magenta blink  sysupgrade writing flash (fast blink = failsafe mode)  -- /etc/diag.sh
+#          white blink    `neon-led identify`
+#
+#   neon-led status              what it shows right now and why
+#   neon-led identify [secs]     blink white for a while (default 30 s), then resume
+#   neon-led set <colour> [mode] hold a colour (mode: steady|blink|fast|dip); `neon-led resume` ends it
+#   neon-led show <colour> [mode] write the LEDs once, no daemon involvement (used by the init script)
+
+LEDS=/sys/class/leds
+CONF=neon_led
+STATE=/var/run/neon-led.state
+OVERRIDE=/var/run/neon-led.override
+TICK=3
+
+# ---------------------------------------------------------------- LEDs
+led() {	# led <name> on|off|netdev <dev>|<delay_on> <delay_off>
+	local d=$LEDS/$1
+	[ -d "$d" ] || return 0
+	case "$2" in
+	on)     echo none > $d/trigger; echo 1 > $d/brightness ;;
+	off)    echo none > $d/trigger; echo 0 > $d/brightness ;;
+	netdev) echo netdev > $d/trigger; echo "$3" > $d/device_name
+	        echo 1 > $d/link; echo 1 > $d/tx; echo 1 > $d/rx; echo 50 > $d/interval ;;
+	*)      echo timer > $d/trigger; echo $2 > $d/delay_on; echo $3 > $d/delay_off ;;
+	esac
+}
+
+show() {	# show <colour> [steady|blink|fast|dip|activity] [netdev]
+	local colour=$1 mode=${2:-steady} dev=$3 r=off g=off b=off c
+	case "$colour" in
+	red) r=on ;; green) g=on ;; blue) b=on ;; yellow) r=on g=on ;;
+	cyan) g=on b=on ;; magenta) r=on b=on ;; white) r=on g=on b=on ;;
+	esac
+	for c in "red:status $r" "green:status $g" "blue:status $b"; do
+		set -- $c
+		if [ "$2" = on ]; then
+			case "$mode" in
+			blink)    led $1 500 500 ;;
+			fast)     led $1 100 100 ;;
+			dip)      led $1 1800 200 ;;
+			activity) led $1 netdev "$dev" ;;
+			*)        led $1 on ;;
+			esac
+		else
+			led $1 off
+		fi
+	done
+}
+
+# ---------------------------------------------------------------- probes
+cfg() { uci -q get $CONF.led.$1 || echo "$2"; }
+load_config() {
+	ROLE=$(cfg role auto);            ACTIVITY=$(cfg activity 0)
+	WEAK=$(cfg weak_rssi -75);        GRACE=$(cfg grace 120)
+	INET_HOSTS=$(cfg inet_hosts "1.1.1.1 8.8.8.8")
+	PROBE_EVERY=$(cfg probe_interval 10); FAILS=$(cfg fails 3)
+	ENABLED=$(cfg enabled 1)
+}
+uptime_s() { local up; read up _ < /proc/uptime; echo ${up%.*}; }
+# two pings per host: one reply is enough, so a single lost packet is never a failed round
+any_ok() { local h; for h in $1; do ping -c2 -W1 -q $h 2>/dev/null | grep -q " [1-9][0-9]* packets received" && return 0; done; return 1; }
+
+# _ok flips to 0 only after FAILS consecutive failed rounds (the mesh drops the
+# odd packet), back to 1 on the first success.
+probe_inet() {
+	if any_ok "$INET_HOSTS"; then inet_ok=1; inet_fail=0
+	else inet_fail=$((inet_fail + 1)); [ $inet_fail -ge $FAILS ] && inet_ok=0; fi
+}
+probe_gw() {
+	if any_ok "$gw"; then gw_ok=1; gw_fail=0
+	else gw_fail=$((gw_fail + 1)); [ $gw_fail -ge $FAILS ] && gw_ok=0; fi
+}
+
+detect_role() {
+	case "$ROLE" in router|satellite) role=$ROLE; return ;; esac
+	[ -n "$(uci -q get network.wan)" ] && role=router || role=satellite
+}
+wan_status() {	# -> wdev wup wcarrier
+	local st; st=$(ubus -S call network.interface.wan status 2>/dev/null)
+	wup=$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)
+	wdev=$(echo "$st" | jsonfilter -e '@.device' 2>/dev/null)
+	[ -n "$wdev" ] || wdev=$(uci -q get network.wan.device)
+	wcarrier=$(cat /sys/class/net/$wdev/carrier 2>/dev/null); [ -n "$wcarrier" ] || wcarrier=0
+}
+mesh_status() {	# -> mdev peers best   (ESTAB peers, best signal in dBm)
+	[ -n "$mdev" ] && [ -d /sys/class/net/$mdev ] || \
+		mdev=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type mesh point/{print i; exit}')
+	set -- $(iw dev "$mdev" station dump 2>/dev/null | awk -v best=-999 '
+		function flush() { if (seen && est) { n++; if (sig > best) best = sig }; seen = 1; est = 0; sig = -999 }
+		/^Station/ { flush() }
+		/mesh plink:/ { if ($3 == "ESTAB") est = 1 }
+		/^[ \t]*signal:/ { sig = $2 + 0 }
+		END { flush(); print n + 0, (n ? best : -999) }')
+	peers=${1:-0}; best=${2:--999}
+}
+base_path() {	# -> hop hopsig hops: the mesh link carrying traffic to the base (gateway ARP -> 802.11s proxy table -> mpath)
+	local gwmac basemac
+	hop=""; hopsig=-999; hops=0
+	gwmac=$(ip -4 neigh show "$gw" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "lladdr") { print $(i + 1); exit }}')
+	[ -n "$gwmac" ] || return 0
+	basemac=$(iw dev "$mdev" mpp dump 2>/dev/null | awk -v m="$gwmac" '$1 == m { print $2; exit }')
+	[ -n "$basemac" ] || return 0
+	set -- $(iw dev "$mdev" mpath get "$basemac" 2>/dev/null | awk 'NR == 1 { print $2, $11 }')   # no header; HOP_COUNT is column 11
+	hop=$1; hops=${2:-0}; [ -n "$hop" ] || return 0
+	hopsig=$(iw dev "$mdev" station get "$hop" 2>/dev/null | awk '/^[ \t]*signal avg:/ { print $3 + 0; exit }')   # driver-smoothed average
+	[ -n "$hopsig" ] || hopsig=-999
+}
+gateway() {
+	local g; g=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit }}')
+	[ -n "$g" ] || g=$(uci -q get network.lan.gateway); [ -n "$g" ] || g=192.168.0.1
+	echo $g
+}
+
+evaluate() {	# -> want ("colour mode [dev]") why role
+	local now=$(uptime_s) due=0
+	[ $((now - last_probe)) -ge $PROBE_EVERY ] && due=1
+	detect_role
+	if [ "$role" = router ]; then
+		wan_status
+		if [ "$wcarrier" != 1 ]; then
+			want="red steady"; why="no link on the WAN port ($wdev)"; last_probe=-999
+		elif [ "$wup" != true ]; then
+			want="yellow blink"; why="WAN link up, interface not up yet (waiting for an address)"; last_probe=-999
+		else
+			[ $due = 1 ] && { probe_inet; last_probe=$now; }
+			if [ $inet_ok = 1 ]; then
+				[ "$ACTIVITY" = 1 ] && want="green activity $wdev" || want="green steady"
+				why="internet reachable via $wdev"
+			else
+				want="yellow steady"; why="WAN up ($wdev), internet unreachable ($inet_fail probe rounds failed)"
+			fi
+		fi
+	else
+		mesh_status
+		if [ "$peers" = 0 ]; then
+			[ -n "$lost_at" ] || lost_at=$now
+			if [ $((now - lost_at)) -lt $GRACE ]; then
+				want="cyan blink"; why="searching for a mesh peer on ${mdev:-?} ($((now - lost_at)) s)"
+			else
+				want="red blink"; why="no mesh peer on ${mdev:-?} for $((now - lost_at)) s"
+			fi
+			last_probe=-999
+		else
+			lost_at=""; gw=$(gateway)
+			[ $due = 1 ] && { probe_gw; [ $gw_ok = 1 ] && probe_inet; last_probe=$now; }
+			# the link that matters is the next hop towards the base; before the path is known, the best peer
+			base_path
+			if [ -n "$hop" ]; then link="to base via $hop $hopsig dBm ($hops hop)"; sig=$hopsig
+			else link="best peer $best dBm"; sig=$best; fi
+			if [ $gw_ok != 1 ]; then
+				want="cyan steady"; why="$peers mesh peer(s), $link, base $gw unreachable"
+			elif [ $inet_ok != 1 ]; then
+				want="yellow steady"; why="$peers mesh peer(s), $link, internet unreachable"
+			elif [ "$WEAK" != 0 ] && { [ $sig -lt $WEAK ] || { [ "$weak" = 1 ] && [ $sig -lt $((WEAK + 5)) ]; }; }; then
+				weak=1; want="green dip"; why="all good but weak link $link (< $WEAK)"
+			else
+				weak=0; [ "$ACTIVITY" = 1 ] && want="green activity $mdev" || want="green steady"
+				why="$peers mesh peer(s), $link, base + internet reachable"
+			fi
+		fi
+	fi
+}
+
+# ---------------------------------------------------------------- daemon
+apply() {	# apply "colour mode [dev]" -- only touches sysfs on a change (rewriting restarts the blink)
+	[ "$1" = "$shown" ] && return 0
+	set -- $1; show "$1" "$2" "$3"; shown="$*"
+}
+record() {	# record "want" "why" role -- syslog + 'since' on a colour change, the reason on every tick
+	[ "$1" != "$logged" ] && { logged=$1; since=$(date '+%F %T'); logger -t neon-led -p daemon.notice "$1: $2"; }
+	echo "$1|$2|$3|$since" > $STATE
+}
+run() {
+	local n=0 oc om oe
+	inet_ok=0 inet_fail=0 gw_ok=0 gw_fail=0 last_probe=-999 lost_at="" shown="" logged="" weak=0
+	load_config
+	trap 'exit 0' TERM INT
+	while :; do
+		[ $((n % 20)) = 0 ] && load_config; n=$((n + 1))
+		if [ "$ENABLED" = 0 ]; then
+			apply "off steady"; record "off steady" "disabled in /etc/config/$CONF" "-"
+		elif [ -s $OVERRIDE ] && read oc om oe < $OVERRIDE && { [ "$oe" = 0 ] || [ $(uptime_s) -lt $oe ]; }; then
+			apply "$oc $om"; record "$oc $om" "held by 'neon-led set/identify'" "-"
+		else
+			rm -f $OVERRIDE
+			evaluate; apply "$want"; record "$want" "$why" "$role"
+		fi
+		sleep $TICK
+	done
+}
+daemon_running() { pgrep -f "neon-led run" >/dev/null 2>&1; }
+
+case "$1" in
+run)      run ;;
+show)     show "$2" "$3" "$4" ;;
+status)
+	load_config; FAILS=1; inet_ok=0 inet_fail=0 gw_ok=0 gw_fail=0 last_probe=-999 lost_at=""
+	[ -s $STATE ] && IFS='|' read c w r t < $STATE && echo "daemon : $c -- $w  [role $r, since $t]" || echo "daemon : not running"
+	evaluate; echo "now    : $want -- $why  [role $role]" ;;
+identify) echo "white blink $(( $(uptime_s) + ${2:-30} ))" > $OVERRIDE
+	daemon_running || { show white blink; sleep ${2:-30}; show blue; rm -f $OVERRIDE; } ;;
+set)      [ -n "$2" ] || { echo "usage: neon-led set <colour> [steady|blink|fast|dip]" >&2; exit 1; }
+	echo "$2 ${3:-steady} 0" > $OVERRIDE; daemon_running || show "$2" "${3:-steady}" ;;
+resume)   rm -f $OVERRIDE; daemon_running || show blue ;;
+*)        sed -n '2,25p' "$0"; exit 1 ;;
+esac

@@ -1,0 +1,318 @@
+#!/bin/sh
+# neon-role -- put an MH7021 in its place in the neon mesh, from a fresh flash or after a sysupgrade,
+# in one idempotent command (busybox sh; replaces satellite_config.py).
+#
+#   neon-role router      [--key K] [--rootpw P]   base: WAN on the 'wan' jack, DHCP/DNS/firewall,
+#                                                  flow offload + packet steering + irqbalance, mesh root
+#   neon-role satellite N [--key K] [--rootpw P]   dumb AP N: static 192.168.0.(1+N), both jacks in br-lan,
+#                                                  dnsmasq/odhcpd/firewall off, mesh leaf
+#   neon-role apply                                re-apply the current role's tuning (e.g. after an
+#                                                  upgrade); never touches keys, passwords or addresses
+#   neon-role status                               what is actually running right now
+#   Options: --key K     WiFi + mesh key (required once on a fresh unit; kept otherwise)
+#            --rootpw P  root password        --no-wait  return right after committing
+#
+# Secrets are arguments only and never stored here. Fleet defaults are below; a unit can override any
+# of them in /etc/neon/tunables (a sh fragment such as MESH_HTMODE=VHT80), which survives sysupgrade.
+# Radios are mapped by their DT path (PCIe = QCA9888 backhaul, a000000 = 2.4 GHz, a800000 = 5 GHz-low),
+# not by radioN number. Every service restart runs detached (setsid) so the ssh session that started
+# it never hangs (a plain `& ` leaves the ssh session waiting on the restart).
+
+NET=192.168.0;        BASE_IP=$NET.1
+SSID=CHANGEME;        MESH_ID=CHANGEME-mesh; COUNTRY=IN   # set these before use
+# MESH_TXPOWER=26 and MESH_RSSI_THRESHOLD=-80: measured, see docs/MESH-TUNING.md.
+# 26 dBm is the plateau of a 18->30 dBm sweep (2.8x throughput on the slab link, no gain
+# above 26). -80 suppresses a useless ~-90 dBm direct peering between the two
+# far-apart nodes, which otherwise churns with SAE auth failures and 300 s blocks.
+MESH_CH=149;          MESH_HTMODE=VHT40;   MESH_TXPOWER=26;   MESH_RSSI_THRESHOLD=-80
+AP2_CH=6;             AP2_HTMODE=HT20
+AP5_CH=36;            AP5_HTMODE=VHT80
+AP_11K=1;             AP_11V=1;            AP_MAX_INACTIVITY=300
+ROUTER_ROOTMODE=4;    ROUTER_GATE_ANN=1
+ROUTER_FLOW_OFFLOAD=1; ROUTER_PACKET_STEERING=1; ROUTER_IRQBALANCE=1
+DHCP_START=100;       DHCP_LIMIT=150;      DHCP_LEASE=12h
+NEON_HOST_NAME=buildhost;  NEON_HOST_MAC=00:00:00:00:00:00;  NEON_HOST_IP=$NET.5
+SAT_MAX=3
+TUNABLES=/etc/neon/tunables
+[ -r $TUNABLES ] && . $TUNABLES
+
+die() { echo "neon-role: $*" >&2; exit 1; }
+u() { uci -q "$@"; }
+say() { echo "neon-role: $*"; }
+
+# ---------------------------------------------------------------- discovery
+map_radios() {
+	R_MESH=""; R_2G=""; R_5G=""
+	for r in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		case "$(u get wireless.$r.path)" in
+		*pci*)          R_MESH=$r ;;
+		*a000000.wifi*) R_2G=$r ;;
+		*a800000.wifi*) R_5G=$r ;;
+		esac
+	done
+	[ -n "$R_MESH" ] && [ -n "$R_2G" ] && [ -n "$R_5G" ] || \
+		die "radio map incomplete (mesh=$R_MESH 2g=$R_2G 5g=$R_5G) -- run 'wifi config' first"
+}
+detect_role() {	# -> ROLE N IP HOSTNAME from the live config
+	if [ -n "$(u get network.wan)" ]; then
+		ROLE=router; N=0; IP=$BASE_IP; HOSTNAME=neon-router
+	else
+		IP=$(u get network.lan.ipaddr); N=$(( ${IP##*.} - 1 ))
+		[ "$N" -ge 1 ] 2>/dev/null || die "cannot derive the satellite number from lan.ipaddr='$IP'"
+		ROLE=satellite; HOSTNAME=neon-sat$N
+	fi
+}
+mesh_dev() { iw dev 2>/dev/null | awk '/Interface/{i=$2} /type mesh point/{print i; exit}'; }
+
+# ---------------------------------------------------------------- uci
+ap_iface() {	# ap_iface <section> <radio>: client AP with the fleet settings (11k/11v, inactivity)
+	local s=$1 r=$2
+	u get wireless.$s >/dev/null || uci set wireless.$s=wifi-iface
+	uci batch <<-EOT
+		set wireless.$s.device='$r'
+		set wireless.$s.mode='ap'
+		set wireless.$s.ssid='$SSID'
+		set wireless.$s.encryption='psk2'
+		set wireless.$s.network='lan'
+		set wireless.$s.ieee80211k='$AP_11K'
+		set wireless.$s.bss_transition='$AP_11V'
+		set wireless.$s.max_inactivity='$AP_MAX_INACTIVITY'
+		set wireless.$s.disabled='0'
+	EOT
+	[ -n "$KEY" ] && uci set wireless.$s.key="$KEY"
+	[ -n "$(u get wireless.$s.key)" ] || die "no WiFi key on wireless.$s -- pass --key"
+}
+config_wireless() {
+	map_radios
+	uci batch <<-EOT
+		set wireless.$R_2G.country='$COUNTRY'
+		set wireless.$R_2G.channel='$AP2_CH'
+		set wireless.$R_2G.htmode='$AP2_HTMODE'
+		set wireless.$R_2G.disabled='0'
+		set wireless.$R_5G.country='$COUNTRY'
+		set wireless.$R_5G.channel='$AP5_CH'
+		set wireless.$R_5G.htmode='$AP5_HTMODE'
+		set wireless.$R_5G.disabled='0'
+		set wireless.$R_MESH.country='$COUNTRY'
+		set wireless.$R_MESH.channel='$MESH_CH'
+		set wireless.$R_MESH.htmode='$MESH_HTMODE'
+		set wireless.$R_MESH.disabled='0'
+	EOT
+	if [ -n "$MESH_TXPOWER" ]; then uci set wireless.$R_MESH.txpower="$MESH_TXPOWER"; else u delete wireless.$R_MESH.txpower; fi
+	u delete wireless.default_$R_MESH		# no client SSID on the backhaul radio
+	ap_iface default_$R_2G $R_2G
+	ap_iface default_$R_5G $R_5G
+	u get wireless.mesh0 >/dev/null || uci set wireless.mesh0=wifi-iface
+	uci batch <<-EOT
+		set wireless.mesh0.device='$R_MESH'
+		set wireless.mesh0.mode='mesh'
+		set wireless.mesh0.mesh_id='$MESH_ID'
+		set wireless.mesh0.encryption='sae'
+		set wireless.mesh0.network='lan'
+		set wireless.mesh0.mesh_fwding='1'
+		set wireless.mesh0.disassoc_low_ack='0'
+		set wireless.mesh0.mesh_rssi_threshold='$MESH_RSSI_THRESHOLD'
+		set wireless.mesh0.disabled='0'
+	EOT
+	[ -n "$KEY" ] && uci set wireless.mesh0.key="$KEY"
+	[ -n "$(u get wireless.mesh0.key)" ] || die "no mesh key on wireless.mesh0 -- pass --key"
+	if [ "$ROLE" = router ]; then
+		uci set wireless.mesh0.mesh_hwmp_rootmode="$ROUTER_ROOTMODE"
+		uci set wireless.mesh0.mesh_gate_announcements="$ROUTER_GATE_ANN"
+	else
+		u delete wireless.mesh0.mesh_hwmp_rootmode; u delete wireless.mesh0.mesh_gate_announcements
+	fi
+	uci commit wireless
+}
+config_network() {
+	[ -n "$(u get network.@device[0])" ] || uci add network device >/dev/null
+	uci batch <<-EOT
+		set network.@device[0].name='br-lan'
+		set network.@device[0].type='bridge'
+		set network.lan=interface
+		set network.lan.device='br-lan'
+		set network.lan.proto='static'
+		set network.lan.ipaddr='$IP'
+		set network.lan.netmask='255.255.255.0'
+		set network.lan.ip6assign='60'
+	EOT
+	if [ "$ROLE" = router ]; then
+		uci batch <<-EOT
+			set network.@device[0].ports='lan'
+			set network.wan=interface
+			set network.wan.device='wan'
+			set network.wan.proto='dhcp'
+			set network.wan6=interface
+			set network.wan6.device='wan'
+			set network.wan6.proto='dhcpv6'
+			set network.globals.packet_steering='$ROUTER_PACKET_STEERING'
+		EOT
+		u delete network.lan.gateway; u delete network.lan.dns
+	else
+		uci batch <<-EOT
+			set network.@device[0].ports='lan wan'
+			set network.lan.gateway='$BASE_IP'
+			set network.lan.dns='$BASE_IP'
+		EOT
+		u delete network.wan; u delete network.wan6; u delete network.globals.packet_steering
+	fi
+	uci commit network
+}
+config_dhcp() {
+	local n
+	if [ "$ROLE" = router ]; then
+		u delete dhcp.lan.ignore
+		uci batch <<-EOT
+			set dhcp.lan=dhcp
+			set dhcp.lan.interface='lan'
+			set dhcp.lan.start='$DHCP_START'
+			set dhcp.lan.limit='$DHCP_LIMIT'
+			set dhcp.lan.leasetime='$DHCP_LEASE'
+			set dhcp.wan=dhcp
+			set dhcp.wan.interface='wan'
+			set dhcp.wan.ignore='1'
+			set dhcp.$NEON_HOST_NAME=host
+			set dhcp.$NEON_HOST_NAME.name='$NEON_HOST_NAME'
+			set dhcp.$NEON_HOST_NAME.mac='$NEON_HOST_MAC'
+			set dhcp.$NEON_HOST_NAME.ip='$NEON_HOST_IP'
+			set dhcp.$NEON_HOST_NAME.dns='1'
+			set dhcp.router=domain
+			set dhcp.router.name='neon-router'
+			set dhcp.router.ip='$BASE_IP'
+		EOT
+		n=1; while [ $n -le $SAT_MAX ]; do
+			uci set dhcp.sat$n=domain; uci set dhcp.sat$n.name="neon-sat$n"; uci set dhcp.sat$n.ip="$NET.$((n + 1))"
+			n=$((n + 1))
+		done
+	else
+		uci set dhcp.lan.ignore='1'
+		u delete dhcp.$NEON_HOST_NAME; u delete dhcp.router
+		n=1; while [ $n -le $SAT_MAX ]; do u delete dhcp.sat$n; n=$((n + 1)); done
+	fi
+	uci commit dhcp
+}
+config_firewall() {
+	[ "$ROLE" = router ] || return 0
+	uci set firewall.@defaults[0].flow_offloading="$ROUTER_FLOW_OFFLOAD"
+	u delete firewall.@defaults[0].flow_offloading_hw	# no hardware offload on ipq40xx
+	uci commit firewall
+}
+config_system() {
+	uci batch <<-EOT
+		set system.@system[0].hostname='$HOSTNAME'
+		set system.@system[0].zonename='Asia/Kolkata'
+		set system.@system[0].timezone='IST-5:30'
+		set system.@system[0].log_size='128'
+		set system.@system[0].ttylogin='0'
+		set system.ntp=timeserver
+		set system.ntp.enabled='1'
+	EOT
+	if [ "$ROLE" = router ]; then
+		uci set system.ntp.enable_server='1'
+		if [ -z "$(u get system.ntp.server)" ] || [ "$(u get system.ntp.server)" = "$BASE_IP" ]; then
+			u delete system.ntp.server
+			for s in 0 1 2 3; do uci add_list system.ntp.server="$s.openwrt.pool.ntp.org"; done
+		fi
+	else
+		uci set system.ntp.enable_server='0'
+		u delete system.ntp.server; uci add_list system.ntp.server="$BASE_IP"	# time without DNS
+	fi
+	uci commit system
+	# ssh and LuCI on the LAN address only
+	uci set dropbear.@dropbear[0].Interface='lan'; uci commit dropbear
+	if [ -n "$(u get uhttpd.main)" ]; then
+		u delete uhttpd.main.listen_http; u delete uhttpd.main.listen_https
+		uci add_list uhttpd.main.listen_http="$IP:80"; uci add_list uhttpd.main.listen_https="$IP:443"
+		uci commit uhttpd
+	fi
+	[ -x /etc/init.d/irqbalance ] && { uci set irqbalance.irqbalance.enabled="$([ "$ROLE" = router ] && echo $ROUTER_IRQBALANCE || echo 0)"; uci commit irqbalance; }
+	mkdir -p /etc/neon; echo "$ROLE $N" > /etc/neon/role
+}
+set_rootpw() {
+	[ -n "$ROOTPW" ] || return 0
+	printf '%s\n%s\n' "$ROOTPW" "$ROOTPW" | passwd root >/dev/null 2>&1 && say "root password set" || die "passwd failed"
+}
+restart_all() {	# detached; the ssh session that ran us must not hang on netifd
+	local en dis
+	if [ "$ROLE" = router ]; then
+		en="dnsmasq odhcpd firewall"; [ "$ROUTER_IRQBALANCE" = 1 ] && en="$en irqbalance"; dis="sqm"
+	else
+		en=""; dis="dnsmasq odhcpd firewall sqm irqbalance"
+	fi
+	cat > /tmp/neon-role-apply.sh <<-EOT
+		sleep 1
+		/etc/init.d/system reload 2>/dev/null
+		for s in $dis; do [ -x /etc/init.d/\$s ] && { /etc/init.d/\$s disable; /etc/init.d/\$s stop; }; done
+		/etc/init.d/network restart
+		sleep 8
+		wifi reload
+		for s in $en; do [ -x /etc/init.d/\$s ] && { /etc/init.d/\$s enable; /etc/init.d/\$s restart; }; done
+		[ "$ROLE" = satellite ] && { rm -f /tmp/resolv.conf; ln -s /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf; }
+		/etc/init.d/packet_steering restart 2>/dev/null
+		/etc/init.d/dropbear restart; /etc/init.d/uhttpd restart 2>/dev/null; /etc/init.d/sysntpd restart
+		/etc/init.d/neon-led restart 2>/dev/null
+		echo "neon-role: applied $ROLE $N at \$(date)"
+	EOT
+	setsid sh /tmp/neon-role-apply.sh </dev/null >/tmp/neon-role-apply.log 2>&1 &
+	say "restarting network/wifi/services detached (log: /tmp/neon-role-apply.log)"
+}
+apply_all() {
+	config_system; config_network; config_dhcp; config_firewall; config_wireless; set_rootpw
+	say "config committed: $ROLE $N ($HOSTNAME, $IP) mesh=$R_MESH 2g=$R_2G 5g=$R_5G"
+	restart_all
+	[ "$NOWAIT" = 1 ] && return 0
+	say "waiting 45 s, then status"; sleep 45; status
+}
+
+# ---------------------------------------------------------------- status
+status() {
+	local mdev role n ip rel gw s
+	detect_role 2>/dev/null; mdev=$(mesh_dev)
+	rel=$(sed -n 's/^NEON_RELEASE=//p' /etc/neon-release 2>/dev/null)
+	echo "unit    : $(cat /proc/sys/kernel/hostname) = $ROLE $N at $(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}')"
+	echo "image   : $(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release) / neon ${rel:-<none>} / $(uname -r) / driver $(apk list --installed 2>/dev/null | grep -oE '^kmod-ath10k(-ct)?-' | head -1 | sed 's/-$//; s/kmod-//')"
+	echo "uptime  : $(cut -d. -f1 /proc/uptime) s, MemAvailable $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MiB, load $(cut -d' ' -f1-3 /proc/loadavg)"
+	iw dev 2>/dev/null | awk '/Interface/{i=$2} /type/{t=$2} /channel/{printf "radio   : %-10s %-10s ch %s width %s MHz\n", i, t, $2, $5}'
+	if [ -n "$mdev" ]; then
+		iw dev $mdev station dump 2>/dev/null | awk '/^Station/{m=$2} /mesh plink:/{p=$3} /signal avg:/{s=$3} /tx bitrate:/{b=$3" "$4} /tx failed:/{f=$3} /^$/{if(m){printf "peer    : %s %s %s dBm tx %s failed %s\n", m, p, s, b, f; m=""}} END{if(m)printf "peer    : %s %s %s dBm tx %s failed %s\n", m, p, s, b, f}'
+		echo "mpath   : $(iw dev $mdev mpath dump 2>/dev/null | grep -c "^..:") path(s)"
+	fi
+	s=""; for n in dnsmasq odhcpd firewall irqbalance sqm; do
+		if [ -x /etc/init.d/$n ]; then /etc/init.d/$n running 2>/dev/null && s="$s $n:on" || s="$s $n:off"; else s="$s $n:-"; fi
+	done
+	echo "services:$s  packet_steering=$(u get network.globals.packet_steering || echo -)  flowtables=$(nft list flowtables inet fw4 2>/dev/null | grep -c flowtable)"
+	if [ "$ROLE" = router ]; then
+		echo "wan     : up=$(ubus -S call network.interface.wan status 2>/dev/null | jsonfilter -e '@.up') $(ubus -S call network.interface.wan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address') leases=$(wc -l < /tmp/dhcp.leases 2>/dev/null)"
+		gw=8.8.8.8
+	else
+		gw=$(u get network.lan.gateway); gw=${gw:-$BASE_IP}
+		echo "resolv  : $(grep -m1 nameserver /etc/resolv.conf 2>/dev/null || echo none)"
+	fi
+	echo "ping    : $gw $(ping -c2 -W2 -q $gw 2>/dev/null | sed -n 's/.*received, \(.*\) packet loss.*/\1 loss/p; s/.*= \([0-9.]*\)\/.*/\1 ms/p' | tr '\n' ' ')/ 8.8.8.8 $(ping -c2 -W2 -q 8.8.8.8 2>/dev/null | sed -n 's/.*received, \(.*\) packet loss.*/\1 loss/p' )"
+	echo "light   : $(neon-led status 2>/dev/null | sed -n 's/^now    : //p')"
+	[ -x /usr/sbin/neon-watchdog ] && echo "watchdog: $(neon-watchdog status 2>/dev/null | tr '\n' ' ')"
+	echo "bootcmd : $(fw_printenv -n bootcmd 2>/dev/null || echo 'n/a')"
+}
+
+# ---------------------------------------------------------------- main
+KEY=""; ROOTPW=""; NOWAIT=0
+cmd=$1; shift
+case "$cmd" in
+router)    ROLE=router; N=0 ;;
+satellite) N=$1; shift; [ "$N" -ge 1 ] 2>/dev/null && [ "$N" -le $SAT_MAX ] || die "satellite N must be 1..$SAT_MAX"; ROLE=satellite ;;
+apply)     detect_role ;;
+status)    status; exit 0 ;;
+*)         sed -n '2,20p' "$0"; exit 1 ;;
+esac
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--key)     KEY=$2; shift ;;
+	--rootpw)  ROOTPW=$2; shift ;;
+	--no-wait) NOWAIT=1 ;;
+	*) die "unknown option $1" ;;
+	esac
+	shift
+done
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "motorola,mh7021" ] || die "not an MH7021"
+if [ "$ROLE" = router ]; then IP=$BASE_IP; HOSTNAME=neon-router; else IP=$NET.$((N + 1)); HOSTNAME=neon-sat$N; fi
+apply_all

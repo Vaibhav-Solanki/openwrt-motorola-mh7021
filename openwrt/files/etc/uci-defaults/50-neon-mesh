@@ -1,0 +1,12 @@
+#!/bin/sh
+# neon-mesh fleet defaults. Runs on the first boot of a fresh flash AND again after a config-preserving
+# sysupgrade (uci-defaults are re-run from the new squashfs), so it only fills gaps and never overwrites
+# a value that is already set. Roles, SSIDs and keys are neon-role's job.
+s=$(uci -q get system.@system[0].zonename)
+[ -n "$s" ] || { uci set system.@system[0].zonename='Asia/Kolkata'; uci set system.@system[0].timezone='IST-5:30'; }
+[ -n "$(uci -q get system.@system[0].log_size)" ] || uci set system.@system[0].log_size='128'
+[ -n "$(uci -q get system.@system[0].ttylogin)" ] || uci set system.@system[0].ttylogin='0'
+[ -n "$(uci -q get dropbear.@dropbear[0].Interface)" ] || uci set dropbear.@dropbear[0].Interface='lan'
+uci commit system; uci commit dropbear
+mkdir -p /etc/neon
+exit 0

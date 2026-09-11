@@ -1,0 +1,35 @@
+
+# --- neon-mesh: Motorola MH7021 (appended by owrt/mh7021/apply.sh from generic.mk.snippet) ---
+define Device/motorola_mh7021
+	$(call Device/FitzImage)
+	DEVICE_VENDOR := Motorola
+	DEVICE_MODEL := MH7021
+	SOC := qcom-ipq4019
+	DEVICE_DTS := qcom-ipq4019-mh7021
+	KERNEL_SIZE := 4096k
+	IMAGE_SIZE := 27072k
+	# U-Boot's bootcmd is "sf read 0x84000000 0x180000 0x500000; bootm": the flashed FIT must never
+	# outgrow that read, so the kernel recipe enforces KERNEL_SIZE. The RAM-boot initramfs is exempt.
+	KERNEL = kernel-bin | fit none $$(KDIR)/image-$$(DEVICE_DTS).dtb | check-size $$(KERNEL_SIZE)
+	KERNEL_INITRAMFS = kernel-bin | fit none $$(KDIR)/image-$$(DEVICE_DTS).dtb
+	IMAGE/sysupgrade.bin := append-kernel | append-rootfs | pad-rootfs | append-metadata
+	SUPPORTED_DEVICES := motorola,mh7021
+	# Release driver: mainline ath10k + stock QCA firmware (ath10k-ct has an 802.11s unicast bug on
+	# ipq40xx, greearb/ath10k-ct#210). config.seed builds both driver stacks as =m, so only what a
+	# profile lists lands in its rootfs. The USB removals are belt and braces (config.seed unsets them).
+	DEVICE_PACKAGES := ipq-wifi-motorola_mh7021 \
+		kmod-ath10k ath10k-firmware-qca4019 ath10k-firmware-qca9888 \
+		-kmod-usb-dwc3-qcom -kmod-usb-dwc3 -kmod-usb3
+endef
+TARGET_DEVICES += motorola_mh7021
+
+# Fallback profile from the same tree: ath10k-ct with the full-htt QCA9888 firmware. Same DTS and
+# SUPPORTED_DEVICES, so sysupgrade moves freely between the two images.
+define Device/motorola_mh7021-ct
+	$(Device/motorola_mh7021)
+	DEVICE_VARIANT := ath10k-ct
+	DEVICE_PACKAGES := ipq-wifi-motorola_mh7021 \
+		kmod-ath10k-ct ath10k-firmware-qca4019-ct ath10k-firmware-qca9888-ct-full-htt \
+		-kmod-usb-dwc3-qcom -kmod-usb-dwc3 -kmod-usb3
+endef
+TARGET_DEVICES += motorola_mh7021-ct

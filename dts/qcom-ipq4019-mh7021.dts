@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * Motorola MH7021 (satellite of the MH7022 mesh kit). Qualcomm reference
+ * AP-DK07.1-C1: IPQ4019, 256 MiB DDR, W25Q256 32 MiB SPI-NOR, tri-band
+ * (IPQ4019 2.4 GHz + 5 GHz low, QCA9888 on PCIe for 5 GHz high / backhaul),
+ * two Ethernet jacks on PHY3/PHY4. Derived from the vendor device tree
+ * (qcom-ipq4019 QSDK, Linux 4.4.60) and proven RAM-booting the GL-B2200 image.
+ */
+
+#include "qcom-ipq4019.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/soc/qcom,tcsr.h>
+
+/ {
+	model = "Motorola MH7021";
+	compatible = "motorola,mh7021", "qcom,ipq4019";
+
+	memory {
+		device_type = "memory";
+		reg = <0x80000000 0x10000000>;
+	};
+
+	chosen {
+		bootargs-append = " clk_ignore_unused";
+	};
+
+	aliases {
+		/* the LAN/label MAC lives on the gmac (ART+0x6, see macaddr_art_6) */
+		label-mac-device = &gmac;
+		led-boot = &led_blue;
+		led-failsafe = &led_red;
+		led-running = &led_blue;
+		led-upgrade = &led_green;
+	};
+
+	soc {
+		tcsr@1949000 {
+			compatible = "qcom,tcsr";
+			reg = <0x1949000 0x100>;
+			qcom,wifi_glb_cfg = <TCSR_WIFI_GLB_CFG>;
+		};
+
+		ess_tcsr@1953000 {
+			compatible = "qcom,tcsr";
+			reg = <0x1953000 0x1000>;
+			qcom,ess-interface-select = <TCSR_ESS_PSGMII>;
+		};
+
+		tcsr@1957000 {
+			compatible = "qcom,tcsr";
+			reg = <0x1957000 0x100>;
+			qcom,wifi_noc_memtype_m0_m2 = <TCSR_WIFI_NOC_MEMTYPE_M0_M2>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		/* Both verified by watching the GPIO lines while pressing: reset pulls
+		 * GPIO 18 low, WPS pulls GPIO 49 low (matches the vendor's runtime
+		 * button driver; the vendor DT's labels for these pins are wrong). */
+		reset {
+			label = "reset";
+			gpios = <&tlmm 18 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+
+		wps {
+			label = "wps";
+			gpios = <&tlmm 49 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_WPS_BUTTON>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/* RGB status light: three discrete LEDs (LED7/LED14/LED10 on the
+		 * board) behind one light pipe. Mapped by driving GPIOs from a
+		 * running system with the board in view; U-Boot leaves all three low. */
+		led_red: led-0 {
+			label = "red:status";
+			gpios = <&tlmm 27 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_green: led-1 {
+			label = "green:status";
+			gpios = <&tlmm 24 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_blue: led-2 {
+			label = "blue:status";
+			gpios = <&tlmm 28 GPIO_ACTIVE_HIGH>;
+		};
+
+		/* The vendor DT also names wifi-led-gpios 32/50 (active-low), but
+		 * those LED pads are not populated on this board. */
+	};
+};
+
+&prng {
+	status = "okay";
+};
+
+/* Explicit on release kernels (6.12); main enables them in the dtsi. */
+&crypto {
+	status = "okay";
+};
+
+&cryptobam {
+	status = "okay";
+};
+
+&blsp_dma {
+	status = "okay";
+};
+
+&blsp1_spi1 {
+	pinctrl-0 = <&spi_0_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+	cs-gpios = <&tlmm 12 GPIO_ACTIVE_LOW>;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <24000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "SBL1";
+				reg = <0x0 0x40000>;
+				read-only;
+			};
+
+			partition@40000 {
+				label = "MIBIB";
+				reg = <0x40000 0x20000>;
+				read-only;
+			};
+
+			partition@60000 {
+				label = "QSEE";
+				reg = <0x60000 0x60000>;
+				read-only;
+			};
+
+			partition@c0000 {
+				label = "CDT";
+				reg = <0xc0000 0x10000>;
+				read-only;
+			};
+
+			partition@d0000 {
+				label = "DDRPARAMS";
+				reg = <0xd0000 0x10000>;
+				read-only;
+			};
+
+			partition@e0000 {
+				label = "APPSBLENV";
+				reg = <0xe0000 0x10000>;
+				read-only;
+			};
+
+			partition@f0000 {
+				label = "APPSBL";
+				reg = <0xf0000 0x80000>;
+				read-only;
+			};
+
+			partition@170000 {
+				label = "ART";
+				reg = <0x170000 0x10000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					/* Factory MACs, same values as the U-Boot env:
+					 * 0x0 = wanaddr, 0x6 = ethaddr (LAN / label). */
+					macaddr_art_0: macaddr@0 {
+						compatible = "mac-base";
+						reg = <0x0 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+
+					macaddr_art_6: macaddr@6 {
+						compatible = "mac-base";
+						reg = <0x6 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+
+					precal_art_1000: precal@1000 {
+						reg = <0x1000 0x2f20>;
+					};
+
+					precal_art_5000: precal@5000 {
+						reg = <0x5000 0x2f20>;
+					};
+
+					precal_art_9000: precal@9000 {
+						reg = <0x9000 0x2f20>;
+					};
+				};
+			};
+
+			/* Vendor "Kernel" region: FIT + squashfs, 0x180000-0x1bf0000 */
+			firmware@180000 {
+				compatible = "denx,fit";
+				label = "firmware";
+				reg = <0x180000 0x1a70000>;
+			};
+
+			/* Vendor factory data and jffs2 config -- kept, untouched */
+			partition@1d00000 {
+				label = "cli_factory_ext";
+				reg = <0x1d00000 0x200000>;
+				read-only;
+			};
+
+			partition@1f00000 {
+				label = "storage";
+				reg = <0x1f00000 0x100000>;
+				read-only;
+			};
+		};
+	};
+};
+
+&blsp1_uart1 {
+	pinctrl-0 = <&serial_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&tlmm {
+	mdio_pins: mdio_pinmux {
+		mux_1 {
+			pins = "gpio6";
+			function = "mdio";
+			bias-pull-up;
+		};
+
+		mux_2 {
+			pins = "gpio7";
+			function = "mdc";
+			bias-pull-up;
+		};
+	};
+
+	serial_pins: serial_pinmux {
+		mux {
+			pins = "gpio16", "gpio17";
+			function = "blsp_uart0";
+			bias-disable;
+		};
+	};
+
+	spi_0_pins: spi_0_pinmux {
+		pinmux {
+			function = "blsp_spi0";
+			pins = "gpio13", "gpio14", "gpio15";
+		};
+		pinmux_cs {
+			function = "gpio";
+			pins = "gpio12";
+		};
+		pinconf {
+			pins = "gpio13", "gpio14", "gpio15";
+			drive-strength = <12>;
+			bias-disable;
+		};
+		pinconf_cs {
+			pins = "gpio12";
+			drive-strength = <2>;
+			bias-disable;
+			output-high;
+		};
+	};
+};
+
+&pcie0 {
+	status = "okay";
+	perst-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
+};
+
+&pcie_bridge0 {
+	wifi@0,0 {
+		/* QCA9888 (168c:0056), 5 GHz high band; the vendor's mesh backhaul */
+		compatible = "qcom,ath10k";
+		reg = <0x00010000 0 0 0 0>;
+		ieee80211-freq-limit = <5450000 5900000>;
+		nvmem-cell-names = "pre-calibration";
+		nvmem-cells = <&precal_art_9000>;
+		qcom,ath10k-calibration-variant = "Motorola-MH7021";
+	};
+};
+
+/* The vendor resets the PHYs on GPIO 41 at every boot, and it is needed:
+ * after a warm reboot (kernel restart -> U-Boot crashdump detour -> U-Boot
+ * self-reset) the QCA8072 PHYs were not found on the bus and the switch
+ * ports failed to register. Reset them from the kernel, deterministically. */
+&mdio {
+	status = "okay";
+	pinctrl-0 = <&mdio_pins>;
+	pinctrl-names = "default";
+	reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+	reset-delay-us = <2000>;
+};
+
+&gmac {
+	status = "okay";
+
+	/* Without this the EDMA driver picks a random MAC on every boot and
+	 * lan/wan/br-lan inherit it. */
+	nvmem-cells = <&macaddr_art_6 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&switch {
+	status = "okay";
+};
+
+/* The two jacks are PHY3 and PHY4 (vendor enables switch ports 3 and 4;
+ * the vendor WAN bitmap is PHY4). */
+&swport4 {
+	status = "okay";
+
+	label = "lan";
+	/* Release kernels (6.12) take the port MAC here rather than from &gmac. */
+	nvmem-cells = <&macaddr_art_6 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&swport5 {
+	status = "okay";
+
+	label = "wan";
+	nvmem-cells = <&macaddr_art_0 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&wifi0 {
+	status = "okay";
+	nvmem-cell-names = "pre-calibration";
+	nvmem-cells = <&precal_art_1000>;
+	qcom,ath10k-calibration-variant = "Motorola-MH7021";
+};
+
+&wifi1 {
+	status = "okay";
+	nvmem-cell-names = "pre-calibration";
+	nvmem-cells = <&precal_art_5000>;
+	qcom,ath10k-calibration-variant = "Motorola-MH7021";
+	ieee80211-freq-limit = <5100000 5400000>;
+};

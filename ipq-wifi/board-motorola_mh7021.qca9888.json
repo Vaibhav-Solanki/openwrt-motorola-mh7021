@@ -1,0 +1,9 @@
+[
+ {
+  "data": "parts/bdf/boardData_2_0_QCA9888_5G_Y9690_SBS_HB.bin",
+  "names": [
+   "bus=pci,bmi-chip-id=0,bmi-board-id=23,variant=Motorola-MH7021",
+   "bus=pci,bmi-chip-id=0,bmi-board-id=16,variant=Motorola-MH7021"
+  ]
+ }
+]

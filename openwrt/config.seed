@@ -1,0 +1,73 @@
+# neon-mesh release seed for openwrt-25.12 (v25.12.5). release.sh copies this to .config and runs
+# `make defconfig`; everything not listed takes the branch default. The kernel config is deliberately
+# untouched so kmods from the official 25.12.5 feed keep a matching vermagic.
+CONFIG_TARGET_ipq40xx=y
+CONFIG_TARGET_ipq40xx_generic=y
+# Both device profiles from one build. Multi-profile mode turns the TARGET_DEVICE_* symbols into
+# independent enables (single-profile mode is a Kconfig choice and can select only one device);
+# PER_DEVICE_ROOTFS makes each profile's DEVICE_PACKAGES (generic.mk.snippet) land only in its own
+# rootfs. TARGET_DEVICE_PACKAGES_* is the separate "extra packages" knob and stays empty.
+CONFIG_TARGET_MULTI_PROFILE=y
+# CONFIG_TARGET_ALL_PROFILES is not set
+CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+CONFIG_TARGET_DEVICE_ipq40xx_generic_DEVICE_motorola_mh7021=y
+CONFIG_TARGET_DEVICE_PACKAGES_ipq40xx_generic_DEVICE_motorola_mh7021=""
+CONFIG_TARGET_DEVICE_ipq40xx_generic_DEVICE_motorola_mh7021-ct=y
+CONFIG_TARGET_DEVICE_PACKAGES_ipq40xx_generic_DEVICE_motorola_mh7021-ct=""
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+CONFIG_TARGET_INITRAMFS_COMPRESSION_NONE=y
+
+# identity, signing, extra outputs
+CONFIG_IMAGEOPT=y
+CONFIG_VERSIONOPT=y
+CONFIG_VERSION_NUMBER="25.12.5"
+CONFIG_SIGNED_PACKAGES=y
+CONFIG_SIGNATURE_CHECK=y
+CONFIG_IB=y
+CONFIG_JSON_OVERVIEW_IMAGE_INFO=y
+
+# wireless: both driver stacks are built as modules, the device profiles pick one (generic.mk.snippet)
+CONFIG_PACKAGE_kmod-ath10k=m
+CONFIG_PACKAGE_kmod-ath10k-ct=m
+CONFIG_PACKAGE_ath10k-firmware-qca4019=m
+CONFIG_PACKAGE_ath10k-firmware-qca9888=m
+CONFIG_PACKAGE_ath10k-firmware-qca4019-ct=m
+CONFIG_PACKAGE_ath10k-firmware-qca9888-ct-full-htt=m
+CONFIG_PACKAGE_ath10k-board-qca4019=y
+CONFIG_PACKAGE_ath10k-board-qca9888=y
+CONFIG_PACKAGE_ipq-wifi-motorola_mh7021=y
+# full hostapd/wpa_supplicant: 802.11s + SAE (mesh) and WNM (bss_transition) in one binary
+CONFIG_PACKAGE_wpad-mbedtls=y
+# CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+# CONFIG_PACKAGE_wpad-mesh-mbedtls is not set
+
+# LuCI: the luci-light collection minus luci-proto-ppp (which the collection hard-selects)
+CONFIG_PACKAGE_luci-mod-admin-full=y
+CONFIG_PACKAGE_luci-theme-bootstrap=y
+CONFIG_PACKAGE_luci-proto-ipv6=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_luci-app-package-manager=y
+CONFIG_PACKAGE_luci-app-sqm=y
+CONFIG_PACKAGE_uhttpd=y
+CONFIG_PACKAGE_uhttpd-mod-ubus=y
+CONFIG_PACKAGE_rpcd-mod-rrdns=y
+
+# tools
+CONFIG_PACKAGE_ucert=y
+CONFIG_PACKAGE_uboot-envtools=y
+CONFIG_PACKAGE_irqbalance=y
+CONFIG_PACKAGE_iperf3=y
+CONFIG_PACKAGE_sqm-scripts=y
+
+# dropped from the ipq40xx / router defaults: this board has no USB, no SD/eMMC, and a DHCP WAN
+# CONFIG_PACKAGE_ppp is not set
+# CONFIG_PACKAGE_ppp-mod-pppoe is not set
+# CONFIG_PACKAGE_luci-proto-ppp is not set
+# CONFIG_PACKAGE_kmod-usb-dwc3-qcom is not set
+# CONFIG_PACKAGE_kmod-usb-dwc3 is not set
+# CONFIG_PACKAGE_kmod-usb3 is not set
+# CONFIG_PACKAGE_kmod-fs-ext4 is not set
+# CONFIG_PACKAGE_kmod-fs-f2fs is not set
+# CONFIG_PACKAGE_kmod-mmc is not set
+# CONFIG_PACKAGE_e2fsprogs is not set
+# CONFIG_PACKAGE_mkf2fs is not set

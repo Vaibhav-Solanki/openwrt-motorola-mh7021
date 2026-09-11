@@ -1,0 +1,65 @@
+#!/bin/sh
+# neon-watchdog -- first-boot safety net after a sysupgrade, for units that have no console.
+# rollout.py arms it right before flashing: it leaves the previous image in /etc/neon/rollback.bin and
+# a marker in /etc/neon/watchdog (both preserved across sysupgrade by /lib/upgrade/keep.d/neon-mesh).
+# On the next boot /etc/init.d/neon-watchdog (S99) runs `neon-watchdog run`: once the unit is healthy
+# it disarms and deletes the rollback image; if it is still unhealthy at `deadline` seconds of uptime
+# it flashes the rollback image back (config preserved). Healthy means: the mesh interface and both
+# APs exist, and -- satellite -- at least one ESTAB mesh peer plus a reachable gateway, or -- router --
+# WAN up or at least one ESTAB mesh peer.
+#
+#   neon-watchdog run | status | check | disarm
+#   /etc/neon/watchdog is a sh fragment:  deadline=600  rollback=/etc/neon/rollback.bin  armed=<epoch>  by=<who>
+
+ARM=/etc/neon/watchdog
+LOG="logger -s -t neon-watchdog -p daemon.warn"
+
+healthy() {
+	local mdev n_ap n_est wan_up gw
+	mdev=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type mesh point/{print i; exit}')
+	n_ap=$(iw dev 2>/dev/null | grep -c 'type AP')
+	[ -n "$mdev" ] && [ "$n_ap" -ge 2 ] || { WHY="wifi not up: mesh=${mdev:-none} aps=$n_ap"; return 1; }
+	n_est=$(iw dev $mdev station dump 2>/dev/null | grep -c 'mesh plink:.*ESTAB')
+	if [ -n "$(uci -q get network.wan)" ]; then
+		wan_up=$(ubus -S call network.interface.wan status 2>/dev/null | jsonfilter -e '@.up')
+		[ "$wan_up" = true ] || [ "$n_est" -ge 1 ] || { WHY="router: wan up=$wan_up, ESTAB peers=$n_est"; return 1; }
+	else
+		gw=$(uci -q get network.lan.gateway); gw=${gw:-192.168.0.1}
+		[ "$n_est" -ge 1 ] || { WHY="satellite: no ESTAB mesh peer on $mdev"; return 1; }
+		ping -c2 -W2 -q $gw >/dev/null 2>&1 || { WHY="satellite: $n_est peer(s) but gateway $gw unreachable"; return 1; }
+	fi
+	WHY="ok: mesh=$mdev peers=$n_est aps=$n_ap"; return 0
+}
+disarm() { rm -f $ARM /etc/neon/rollback.bin; }
+run() {
+	local up
+	[ -s $ARM ] || exit 0
+	. $ARM; deadline=${deadline:-600}; rollback=${rollback:-/etc/neon/rollback.bin}
+	$LOG "armed by ${by:-?}: deadline ${deadline}s of uptime, rollback image $rollback"
+	while :; do
+		up=$(cut -d. -f1 /proc/uptime)
+		if healthy; then $LOG "healthy at ${up}s ($WHY) -- disarmed, rollback image removed"; disarm; exit 0; fi
+		[ "$up" -ge "$deadline" ] && break
+		sleep 15
+	done
+	$LOG "NOT healthy at ${up}s ($WHY) -- rolling back to $rollback"
+	rm -f $ARM	# never loop
+	if [ -s "$rollback" ] && cp "$rollback" /tmp/neon-rollback.bin && sysupgrade -T /tmp/neon-rollback.bin >/dev/null 2>&1; then
+		neon-led set magenta blink 2>/dev/null
+		sleep 2
+		exec sysupgrade -v /tmp/neon-rollback.bin
+	fi
+	$LOG "rollback image missing or rejected by sysupgrade -T -- giving up"
+	exit 1
+}
+status() {
+	if [ -s $ARM ]; then echo "armed ($(tr '\n' ' ' < $ARM))"; else echo "disarmed"; fi
+	healthy && echo "health $WHY" || echo "health NOT OK: $WHY"
+}
+case "$1" in
+run)    run ;;
+status) status ;;
+check)  healthy && { echo "$WHY"; exit 0; } || { echo "$WHY"; exit 1; } ;;
+disarm) disarm; echo disarmed ;;
+*)      sed -n '2,13p' "$0"; exit 1 ;;
+esac

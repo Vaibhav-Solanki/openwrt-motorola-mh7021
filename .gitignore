@@ -1,0 +1,15 @@
+# never commit: per-unit calibration, flash dumps, config backups, secrets
+*.bin
+!ipq-wifi/*.json
+parts*/
+chunks/
+config-backup-*/
+*.tar.gz
+*.pem
+key-build*
+*.ucert
+# local run artefacts
+rollout_*.json
+soak_*.csv
+*_console.txt
+__pycache__/

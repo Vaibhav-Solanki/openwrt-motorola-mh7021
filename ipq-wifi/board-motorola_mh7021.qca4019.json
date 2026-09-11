@@ -1,0 +1,16 @@
+[
+ {
+  "data": "parts/bdf/boardData_1_0_IPQ4019_DK04_2G.bin",
+  "names": [
+   "bus=ahb,bmi-chip-id=0,bmi-board-id=20,variant=Motorola-MH7021",
+   "bus=ahb,bmi-chip-id=0,bmi-board-id=16,variant=Motorola-MH7021"
+  ]
+ },
+ {
+  "data": "parts/bdf/boardData_1_0_IPQ4019_DK07_wifi0_5G_HB.bin",
+  "names": [
+   "bus=ahb,bmi-chip-id=0,bmi-board-id=29,variant=Motorola-MH7021",
+   "bus=ahb,bmi-chip-id=0,bmi-board-id=17,variant=Motorola-MH7021"
+  ]
+ }
+]
