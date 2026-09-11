@@ -1,5 +1,13 @@
 # OpenWrt on the Motorola MH7021 / MH7022 mesh kit
 
+*Custom OpenWrt 25.12 firmware for the Motorola MH7021 router (sold as the **MH7022** tri-band
+mesh kit, and as a Minim-managed ISP mesh unit) — a Qualcomm **IPQ4019** device with a dedicated
+**QCA9888** 5 GHz radio. Frees the hardware from Minim's discontinued cloud service. Includes the
+device tree, build and signing scripts, signed release images, `802.11s` mesh role tooling, a
+hardware reference, and measured mesh tuning data.*
+
+**[→ Download the latest signed release](https://github.com/Vaibhav-Solanki/openwrt-motorola-mh7021/releases/latest)**
+
 > ## ⚠️ Disclaimer — read before flashing
 >
 > **Use of this firmware, and of everything in this repository, is entirely at your own risk.**
