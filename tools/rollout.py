@@ -8,7 +8,7 @@ rollout.py -- upgrade one neon-mesh unit to a release image over ssh, safely, an
     python3 router/rollout.py sat1 --dry                    # pre-checks and the plan only, no changes
     python3 router/rollout.py --status                      # fleet summary (all three units)
 
-Images normally come from the release server on neon (http://192.168.0.5:8081/neon-mesh/<tag>/...):
+Images normally come from your release server (set NEON_FEED, e.g. http://buildhost.lan:8081/neon-mesh/<tag>/):
 the unit fetches them itself with wget and the sha256 is checked against the release's sha256sums.
 A local file is pushed with scp -O instead. Steps: pre-checks -> stage the new image in /tmp and the
 rollback image in /etc/neon/ -> sysupgrade -T on both (+ an explicit ucert signature check when the
