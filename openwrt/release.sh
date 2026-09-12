@@ -62,7 +62,6 @@ $FEED_URL/targets/ipq40xx/generic/packages/packages.adb
 $FEED_URL/packages/$ARCH/base/packages.adb
 $FEED_URL/packages/$ARCH/luci/packages.adb
 $FEED_URL/packages/$ARCH/packages/packages.adb
-$FEED_URL/packages/$ARCH/routing/packages.adb
 EOT
 cat $T/files/etc/neon-release
 # `sysupgrade -T` verifies the embedded ucert against /etc/opkg/keys (lib/upgrade/fwtool.sh), but the
@@ -84,6 +83,7 @@ if [ -z "$SKIP_BUILD" ]; then
              TARGET_DEVICE_ipq40xx_generic_DEVICE_motorola_mh7021=y TARGET_DEVICE_ipq40xx_generic_DEVICE_motorola_mh7021-ct=y \
              PACKAGE_ipq-wifi-motorola_mh7021=y PACKAGE_kmod-ath10k=m PACKAGE_kmod-ath10k-ct=m PACKAGE_ath10k-firmware-qca9888=m \
              PACKAGE_wpad-mbedtls=y PACKAGE_ucert=y PACKAGE_uboot-envtools=y PACKAGE_irqbalance=y PACKAGE_iperf3=y \
+             PACKAGE_luci-theme-aurora=y \
              SIGNED_PACKAGES=y SIGNATURE_CHECK=y VERSION_NUMBER=\"25.12.5\" IB=y TARGET_ROOTFS_INITRAMFS=y JSON_OVERVIEW_IMAGE_INFO=y; do
       grep -q "^CONFIG_$k" .config && echo "   ok       CONFIG_$k" || { echo "   MISSING  CONFIG_$k"; bad=1; }
     done
@@ -162,7 +162,7 @@ chk_pkgs() {	# chk_pkgs <label> <rootfs dir> <must-have...> -- <must-not...>
     else [ -e "$d/lib/apk/packages/$p.list" ] && fail "$label: unwanted package $p" || echo "   no      $label: $p"; fi
   done
 }
-chk_pkgs release "$DEV_REL" kmod-ath10k ath10k-firmware-qca4019 ath10k-firmware-qca9888 ipq-wifi-motorola_mh7021 wpad-mbedtls ucert uboot-envtools irqbalance iperf3 sqm-scripts luci-mod-admin-full luci-app-package-manager -- kmod-ath10k-ct ath10k-firmware-qca4019-ct ath10k-firmware-qca9888-ct-full-htt ppp ppp-mod-pppoe luci-proto-ppp kmod-usb3 kmod-usb-dwc3-qcom kmod-fs-ext4 kmod-mmc wpad-basic-mbedtls wpad-mesh-mbedtls
+chk_pkgs release "$DEV_REL" kmod-ath10k ath10k-firmware-qca4019 ath10k-firmware-qca9888 ipq-wifi-motorola_mh7021 wpad-mbedtls ucert uboot-envtools irqbalance iperf3 sqm-scripts luci-mod-admin-full luci-app-package-manager luci-theme-aurora -- kmod-ath10k-ct ath10k-firmware-qca4019-ct ath10k-firmware-qca9888-ct-full-htt ppp ppp-mod-pppoe luci-proto-ppp kmod-usb3 kmod-usb-dwc3-qcom kmod-fs-ext4 kmod-mmc wpad-basic-mbedtls wpad-mesh-mbedtls
 chk_pkgs ct "$DEV_CT" kmod-ath10k-ct ath10k-firmware-qca4019-ct ath10k-firmware-qca9888-ct-full-htt ipq-wifi-motorola_mh7021 wpad-mbedtls ucert -- kmod-ath10k ath10k-firmware-qca4019 ath10k-firmware-qca9888 ppp kmod-usb3
 # board files: every per-device rootfs (target-dir-*) and the shared one must carry the vendor data
 for d in $T/build_dir/target-*/root-ipq40xx $T/build_dir/target-*/linux-ipq40xx_generic/target-dir-*; do

@@ -31,6 +31,13 @@ cp $W/board-motorola_mh7021.qca4019 $W/board-motorola_mh7021.qca9888 $T/package/
 rm -rf $T/files; mkdir -p $T/files && cp -R $S/files/. $T/files/
 find $T/files -type f \( -path '*/usr/sbin/*' -o -path '*/etc/init.d/*' -o -path '*/etc/uci-defaults/*' -o -name diag.sh \) -exec chmod 755 {} +
 
+# 3. third-party packages: luci-theme-aurora, vendored at a pinned commit (luci-theme-aurora/VENDORED.md).
+#    Dropped straight into package/ -- OpenWrt scans that tree recursively -- rather than added as a feed,
+#    so the build needs no extra feed config and no network. config.seed selects it; the theme's own
+#    uci-defaults (30_luci-theme-aurora) makes it the default skin on a unit that has not chosen one.
+rm -rf $T/package/luci-theme-aurora
+cp -R $S/luci-theme-aurora $T/package/luci-theme-aurora
+
 python3 - <<'PY'
 import os, re
 T = os.environ["T"]; ENVF = os.environ.get("ENVF", "")
@@ -110,5 +117,8 @@ if [ -n "$ENVF" ]; then echo "uboot-envtools entry (expect 1): $(grep -c 'motoro
 grep -c "motorola,mh7021" $T/target/linux/ipq40xx/base-files/etc/board.d/01_leds | sed "s/^/01_leds mentions (expect 0): /"
 for f in usr/sbin/neon-led usr/sbin/neon-role usr/sbin/neon-watchdog etc/init.d/neon-led etc/init.d/neon-watchdog etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/diag.sh etc/config/neon_led; do
   [ -e $T/files/$f ] && echo "overlay ok: $f" || echo "overlay MISSING: $f"
+done
+for f in Makefile ucode/template/themes/aurora/header.ut htdocs/luci-static/aurora/main.css htdocs/luci-static/resources/menu-aurora.js root/etc/uci-defaults/30_luci-theme-aurora; do
+  [ -e $T/package/luci-theme-aurora/$f ] && echo "aurora ok: $f" || echo "aurora MISSING: $f"
 done
 git -C $T status --short | sed 's/^/git: /'
