@@ -55,6 +55,7 @@ mesh backhaul on the dedicated QCA9888 radio.
 | `openwrt/config.seed` | build config: both profiles, signing, versioning |
 | `openwrt/build.sh`, `release.sh` | build / sign / verify / publish a tagged release |
 | `openwrt/files/` | rootfs overlay: `neon-role`, `neon-led`, `neon-watchdog` |
+| `openwrt/luci-theme-aurora/` | vendored [luci-theme-aurora](https://github.com/eamonxg/luci-theme-aurora) (Apache-2.0) at a pinned commit — the default LuCI skin; provenance and a known cosmetic bug in its `VENDORED.md` |
 | `ipq-wifi/*.json` | board-file manifests (see [Board files](#board-files)) |
 | `tools/` | flashing, dumping, rollout and soak tooling |
 | `docs/HARDWARE.md` | hardware reference — the part that took longest to establish |

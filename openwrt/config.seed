@@ -44,6 +44,10 @@ CONFIG_PACKAGE_wpad-mbedtls=y
 # LuCI: the luci-light collection minus luci-proto-ppp (which the collection hard-selects)
 CONFIG_PACKAGE_luci-mod-admin-full=y
 CONFIG_PACKAGE_luci-theme-bootstrap=y
+# aurora is the default skin: its own uci-defaults points luci.main.mediaurlbase at it on the first
+# boot of a unit that has not already chosen a theme. bootstrap stays in the image as LuCI's built-in
+# fallback and as the recovery theme (uci set luci.main.mediaurlbase=/luci-static/bootstrap).
+CONFIG_PACKAGE_luci-theme-aurora=y
 CONFIG_PACKAGE_luci-proto-ipv6=y
 CONFIG_PACKAGE_luci-app-firewall=y
 CONFIG_PACKAGE_luci-app-package-manager=y
