@@ -357,7 +357,10 @@ return baseclass.extend({
 			c.dot.className = `nm-dot ${state == 'ok' ? '' : state}`;
 			c.el.title = [ n.status, `${_('up')} ${dur(n.uptime)}`, n.release ].filter(Boolean).join(' · ');
 			c.name.textContent = n.host;
-			c.sub.textContent = n.role == 'router' ? _('Main node') : `${_('Satellite')} ${n.n}${n.uplink ? ` · ${n.uplink.hops} ${n.uplink.hops == 1 ? _('hop') : _('hops')}` : ''}`;
+			// hops from the drawn chain, not the kernel's momentary mesh-path hop count, which can read low
+			// for a moment while a path refreshes
+			const hops = n._depth - 1;
+			c.sub.textContent = n.role == 'router' ? _('Main node') : `${_('Satellite')} ${n.n} · ${hops} ${hops == 1 ? _('hop') : _('hops')}`;
 			c.d.textContent = `↓ ${num(n._down)}`;
 			c.u.textContent = `↑ ${num(n._up)}`;
 			c.what.textContent = n.wan ? _('internet') : _('devices');
@@ -427,7 +430,7 @@ return baseclass.extend({
 				down: n._ldown, up: n._lup, cls: qual.cls,
 				label: u.signal ? `<b style="color:${LED[qual.cls]}">${qual.word}</b> ${u.signal} dBm` : _('mesh'),
 				title: u.signal ? `${n._parent.host} → ${n.host}: ${u.signal} dBm, PHY ↓ ${u.rx_rate} / ↑ ${u.tx_rate} Mbit/s, ` +
-					`${_('expected')} ${u.expected} Mbit/s, ${u.hops} ${_('hop(s) to the base')}; ${_('now')} ↓ ${num(n._ldown)} / ↑ ${num(n._lup)} Mbit/s` : ''
+					`${_('expected')} ${u.expected} Mbit/s, ${n._depth - 1} ${_('hop(s) to the base')}; ${_('now')} ↓ ${num(n._ldown)} / ↑ ${num(n._lup)} Mbit/s` : ''
 			});
 		});
 		for (const [ key, l ] of this.links)

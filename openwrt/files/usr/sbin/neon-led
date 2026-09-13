@@ -115,7 +115,7 @@ base_path() {	# -> hop hopsig hops: the mesh link carrying traffic to the base (
 	[ -n "$gwmac" ] || return 0
 	basemac=$(iw dev "$mdev" mpp dump 2>/dev/null | awk -v m="$gwmac" '$1 == m { print $2; exit }')
 	[ -n "$basemac" ] || return 0
-	set -- $(iw dev "$mdev" mpath get "$basemac" 2>/dev/null | awk 'NR == 1 { print $2, $11 }')   # no header; HOP_COUNT is column 11
+	set -- $(iw dev "$mdev" mpath get "$basemac" 2>/dev/null | awk 'NR == 1 { print $2, $(NF - 1) }')   # no header; HOP_COUNT is second to last
 	hop=$1; hops=${2:-0}; [ -n "$hop" ] || return 0
 	hopsig=$(iw dev "$mdev" station get "$hop" 2>/dev/null | awk '/^[ \t]*signal avg:/ { print $3 + 0; exit }')   # driver-smoothed average
 	[ -n "$hopsig" ] || hopsig=-999

@@ -34,7 +34,9 @@ uplink() {	# uplink <mesh dev>
 	gw=$(uci -q get network.lan.gateway)
 	gwmac=$(ip -4 neigh show "$gw" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
 	[ -n "$gwmac" ] && base=$(iw dev $1 mpp dump 2>/dev/null | awk -v m="$gwmac" '$1 == m { print $2; exit }')
-	[ -n "$base" ] && set -- $(iw dev $1 mpath get $base 2>/dev/null | awk 'NR == 1 { print $2, $11 }') && hop=$1 hops=$2
+	# HOP_COUNT is the second-to-last column (PATH_CHANGE is last); counted from the end so a blank column
+	# cannot shift it
+	[ -n "$base" ] && set -- $(iw dev $1 mpath get $base 2>/dev/null | awk 'NR == 1 { print $2, $(NF - 1) }') && hop=$1 hops=$2
 	[ -n "$hop" ] || { printf 'null'; return; }
 	iw dev $mdev station get $hop 2>/dev/null | awk -v hop=$hop -v hops=${hops:-0} -v base=$base '
 		/^[ \t]*signal avg:/ { sig = $3 }
