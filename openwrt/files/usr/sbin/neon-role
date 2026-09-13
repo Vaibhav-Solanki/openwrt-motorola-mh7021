@@ -32,6 +32,9 @@ ROUTER_ROOTMODE=4;    ROUTER_GATE_ANN=1
 ROUTER_FLOW_OFFLOAD=1; ROUTER_PACKET_STEERING=1; ROUTER_IRQBALANCE=1
 DHCP_START=100;       DHCP_LIMIT=150;      DHCP_LEASE=12h
 NEON_HOST_NAME=buildhost;  NEON_HOST_MAC=00:00:00:00:00:00;  NEON_HOST_IP=$NET.5
+# NEON_HOSTNAME: this unit's name (e.g. neon-kitchen). Unset = keep the name it already has on `apply`,
+# neon-router / neon-satN when a role is (re)assigned.
+NEON_HOSTNAME=
 SAT_MAX=3
 TUNABLES=/etc/neon/tunables
 [ -r $TUNABLES ] && . $TUNABLES
@@ -272,7 +275,7 @@ status() {
 	echo "unit    : $(cat /proc/sys/kernel/hostname) = $ROLE $N at $(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}')"
 	echo "image   : $(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release) / neon ${rel:-<none>} / $(uname -r) / driver $(apk list --installed 2>/dev/null | grep -oE '^kmod-ath10k(-ct)?-' | head -1 | sed 's/-$//; s/kmod-//')"
 	echo "uptime  : $(cut -d. -f1 /proc/uptime) s, MemAvailable $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MiB, load $(cut -d' ' -f1-3 /proc/loadavg)"
-	iw dev 2>/dev/null | awk '/Interface/{i=$2} /type/{t=$2} /channel/{printf "radio   : %-10s %-10s ch %s width %s MHz\n", i, t, $2, $5}'
+	iw dev 2>/dev/null | awk '/Interface/{i=$2} /type/{t=$2} /channel/{printf "radio   : %-10s %-10s ch %s width %s MHz\n", i, t, $2, $6}'	# channel 149 (5745 MHz), width: 40 MHz
 	if [ -n "$mdev" ]; then
 		iw dev $mdev station dump 2>/dev/null | awk '/^Station/{m=$2} /mesh plink:/{p=$3} /signal avg:/{s=$3} /tx bitrate:/{b=$3" "$4} /tx failed:/{f=$3} /^$/{if(m){printf "peer    : %s %s %s dBm tx %s failed %s\n", m, p, s, b, f; m=""}} END{if(m)printf "peer    : %s %s %s dBm tx %s failed %s\n", m, p, s, b, f}'
 		echo "mpath   : $(iw dev $mdev mpath dump 2>/dev/null | grep -c "^..:") path(s)"
@@ -315,4 +318,12 @@ while [ $# -gt 0 ]; do
 done
 [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "motorola,mh7021" ] || die "not an MH7021"
 if [ "$ROLE" = router ]; then IP=$BASE_IP; HOSTNAME=neon-router; else IP=$NET.$((N + 1)); HOSTNAME=neon-sat$N; fi
+# The unit's own name beats the role default: NEON_HOSTNAME from tunables, or -- on `apply`, which only
+# re-tunes a unit that is already in its place -- the hostname it has now. (Before this, every apply,
+# including the one rollout.py ends with, renamed a custom-named unit back to neon-satN.)
+if [ -n "$NEON_HOSTNAME" ]; then
+	HOSTNAME=$NEON_HOSTNAME
+elif [ "$cmd" = apply ]; then
+	cur=$(u get system.@system[0].hostname); [ -n "$cur" ] && [ "$cur" != OpenWrt ] && HOSTNAME=$cur
+fi
 apply_all

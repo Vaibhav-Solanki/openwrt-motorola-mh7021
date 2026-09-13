@@ -1,0 +1,153 @@
+#!/bin/sh
+# neon-node -- this unit's view of the mesh, for the "Mesh" section of LuCI Status -> Overview (via
+# neon-fleet). busybox sh.
+#
+#   neon-node stats   JSON: identity, live byte counters (WAN, backhaul, APs, jacks), the mesh link this
+#                     unit uses towards the base (next hop, hops, signal, rates, its own byte counters),
+#                     the devices on it (Wi-Fi stations and MACs learned on its Ethernet jacks) and, on the
+#                     router, the host table (DHCP leases, static hosts, ARP) that names them
+#   neon-node token   this unit's fleet token
+#
+# Other units read `stats` through /www/cgi-bin/neon-node on the LAN address with "Authorization: Bearer
+# <token>", token = sha256("neon-fleet:" + mesh key): each unit derives it from its own
+# /etc/config/wireless, so nothing is distributed and changing the mesh key rotates it. (uhttpd hands CGI
+# scripts only a fixed set of headers; Authorization is one of them.)
+
+W=/tmp/neon-node
+mkdir -p $W
+
+jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t'; }	# JSON string body
+ctr() { cat /sys/class/net/$1/statistics/$2_bytes 2>/dev/null || echo 0; }
+join() { awk 'NR > 1 { printf "," } { printf "%s", $0 }'; }	# one JSON value per line -> a,b,c
+token() {
+	local k; k=$(uci -q get wireless.mesh0.key)
+	[ -n "$k" ] || return 1
+	printf 'neon-fleet:%s' "$k" | sha256sum | cut -d' ' -f1
+}
+role() { [ -n "$(uci -q get network.wan)" ] && echo router || echo satellite; }
+counters() { printf '"rx":%s,"tx":%s' "$(ctr $1 rx)" "$(ctr $1 tx)"; }
+
+# the mesh link this satellite sends base-bound traffic over: gateway ARP -> 802.11s proxy table (the
+# base's mesh address) -> mesh path (next hop, hop count) -> that peer's station entry
+uplink() {	# uplink <mesh dev>
+	local gw gwmac base hop hops
+	gw=$(uci -q get network.lan.gateway)
+	gwmac=$(ip -4 neigh show "$gw" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
+	[ -n "$gwmac" ] && base=$(iw dev $1 mpp dump 2>/dev/null | awk -v m="$gwmac" '$1 == m { print $2; exit }')
+	[ -n "$base" ] && set -- $(iw dev $1 mpath get $base 2>/dev/null | awk 'NR == 1 { print $2, $11 }') && hop=$1 hops=$2
+	[ -n "$hop" ] || { printf 'null'; return; }
+	iw dev $mdev station get $hop 2>/dev/null | awk -v hop=$hop -v hops=${hops:-0} -v base=$base '
+		/^[ \t]*signal avg:/ { sig = $3 }
+		/^[ \t]*tx bitrate:/ { txr = $3 }
+		/^[ \t]*rx bitrate:/ { rxr = $3 }
+		/^[ \t]*expected throughput:/ { thr = $3 }
+		/^[ \t]*rx bytes:/ { rxb = $3 }
+		/^[ \t]*tx bytes:/ { txb = $3 }
+		END { printf "{\"mac\":\"%s\",\"base\":\"%s\",\"hops\":%d,\"signal\":%d,\"tx_rate\":%.1f,\"rx_rate\":%.1f,\"expected\":%.1f,\"rx\":%.0f,\"tx\":%.0f}",
+			hop, base, hops, sig, txr, rxr, thr, rxb, txb }'
+}
+
+stations() {	# stations <ap dev> <band>: one JSON object per authorized Wi-Fi client
+	iw dev $1 station dump 2>/dev/null | awk -v dev=$1 -v band="$2" '
+		function flush() {
+			if (mac != "" && auth == "yes")
+				printf "{\"mac\":\"%s\",\"dev\":\"%s\",\"band\":\"%s\",\"signal\":%d,\"tx_rate\":%.1f,\"rx_rate\":%.1f,\"rx\":%.0f,\"tx\":%.0f,\"connected\":%d,\"inactive\":%d}\n",
+					mac, dev, band, sig, txr, rxr, rxb, txb, conn, inact
+			mac = ""; auth = ""; sig = txr = rxr = rxb = txb = conn = inact = 0
+		}
+		/^Station/ { flush(); mac = $2 }
+		/^[ \t]*authorized:/ { auth = $2 }
+		/^[ \t]*signal avg:/ { sig = $3 }
+		/^[ \t]*tx bitrate:/ { txr = $3 }
+		/^[ \t]*rx bitrate:/ { rxr = $3 }
+		/^[ \t]*rx bytes:/ { rxb = $3 }
+		/^[ \t]*tx bytes:/ { txb = $3 }
+		/^[ \t]*connected time:/ { conn = $3 }
+		/^[ \t]*inactive time:/ { inact = $3 }
+		END { flush() }'
+}
+
+wired() {	# MACs the bridge learned on the Ethernet jacks that serve devices (not the mesh, not the WAN)
+	local p
+	: > $W/ports
+	for p in lan wan; do
+		[ -e /sys/class/net/br-lan/brif/$p/port_no ] || continue
+		echo "$(( $(cat /sys/class/net/br-lan/brif/$p/port_no) )) $p" >> $W/ports
+	done
+	[ -s $W/ports ] || return 0
+	brctl showmacs br-lan 2>/dev/null | awk 'NR == FNR { port[$1] = $2; next }
+		FNR > 1 && $3 == "no" && ($1 in port) && $2 !~ /^(01:00:5e|33:33)/ {
+			printf "{\"mac\":\"%s\",\"port\":\"%s\",\"idle\":%d}\n", $2, port[$1], $4 }' $W/ports -
+}
+
+hosts() {	# router only: MAC -> IP / name, from DHCP leases, configured static hosts and the ARP table
+	{
+		uci -q show dhcp | sed -nE "s/^dhcp\.([^.=]+)=host$/\1 = host/p; s/^dhcp\.([^.=]+)\.(name|mac|ip)='([^' ]*)[^']*'$/\1 \2 \3/p" |
+			awk '$2 == "=" { h[$1] = 1 } $2 == "name" { n[$1] = $3 } $2 == "mac" { m[$1] = tolower($3) } $2 == "ip" { i[$1] = $3 }
+				END { for (k in h) if (m[k] != "") print m[k], (i[k] != "" ? i[k] : "-"), n[k] }'
+		awk '{ print tolower($2), $3, ($4 == "*" ? "" : $4) }' /tmp/dhcp.leases 2>/dev/null
+		ip -4 neigh show dev br-lan 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") print tolower($(i + 1)), $1, "" }'
+	} | awk '{ gsub(/["\\]/, "", $3) }
+		!($1 in ip) || ip[$1] == "-" { ip[$1] = $2 }
+		$3 != "" && !($1 in name) { name[$1] = $3 }
+		END { for (m in ip) printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"name\":\"%s\"}\n", m, (ip[m] == "-" ? "" : ip[m]), name[m] }'
+}
+
+stats() {
+	local r ip n mdev light why c st wdev dev freq band chan
+	r=$(role); ip=$(uci -q get network.lan.ipaddr); n=0
+	[ $r = satellite ] && n=$(( ${ip##*.} - 1 ))
+	mdev=$(iw dev 2>/dev/null | awk '/Interface/ { i = $2 } /type mesh point/ { print i; exit }')
+	light=""; why=""
+	[ -s /var/run/neon-led.state ] && IFS='|' read -r light why c < /var/run/neon-led.state
+
+	printf '{"schema":2,"online":true,"host":"%s","role":"%s","n":%d,"ip":"%s","release":"%s",' \
+		"$(jstr "$(cat /proc/sys/kernel/hostname)")" "$r" "$n" "$ip" \
+		"$(jstr "$(sed -n 's/^NEON_RELEASE=//p' /etc/neon-release 2>/dev/null)")"
+	printf '"t":%s,"uptime":%s,"load":"%s","mem_avail_mib":%s,"light":"%s","status":"%s",' \
+		"$(awk '{ print $1 }' /proc/uptime)" "$(cut -d. -f1 /proc/uptime)" "$(cut -d' ' -f1-3 /proc/loadavg)" \
+		"$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)" "$(jstr "$light")" "$(jstr "$why")"
+	printf '"lan_mac":"%s","mesh_mac":"%s",' "$(cat /sys/class/net/br-lan/address 2>/dev/null)" \
+		"$([ -n "$mdev" ] && cat /sys/class/net/$mdev/address)"
+
+	# internet: the WAN's layer-3 device (wan today, pppoe-wan if the WAN ever becomes PPPoE)
+	if [ $r = router ]; then
+		st=$(ubus -S call network.interface.wan status 2>/dev/null)
+		wdev=$(echo "$st" | jsonfilter -e '@.l3_device' 2>/dev/null); [ -n "$wdev" ] || wdev=$(uci -q get network.wan.device)
+		printf '"wan":{"dev":"%s","up":%s,%s},"uplink":null,' "$wdev" "$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null || echo false)" "$(counters "$wdev")"
+	else
+		printf '"wan":null,"uplink":%s,' "$([ -n "$mdev" ] && uplink $mdev || echo null)"
+	fi
+	if [ -n "$mdev" ]; then
+		printf '"mesh":{"dev":"%s","peers":%s,%s},' $mdev \
+			"$(iw dev $mdev station dump 2>/dev/null | grep -c 'mesh plink:.*ESTAB')" "$(counters $mdev)"
+	else
+		printf '"mesh":null,'
+	fi
+
+	: > $W/radios; : > $W/clients
+	for dev in $(iw dev 2>/dev/null | awk '/Interface/ { i = $2 } /type AP/ { print i }'); do
+		set -- $(iw dev $dev info 2>/dev/null | awk '/channel/ { gsub(/\(/, "", $3); print $2, $3 + 0; exit }')
+		chan=${1:-0}; freq=${2:-0}
+		[ "$freq" -lt 3000 ] && band="2.4 GHz" || band="5 GHz"
+		printf '{"dev":"%s","band":"%s","channel":%d,%s}\n' $dev "$band" $chan "$(counters $dev)" >> $W/radios
+		stations $dev "$band" >> $W/clients
+	done
+	printf '"radios":[%s],"clients":[%s],' "$(join < $W/radios)" "$(join < $W/clients)"
+
+	printf '"ports":['
+	for dev in lan wan; do
+		[ -d /sys/class/net/$dev ] || continue
+		[ $r = router ] && [ $dev = wan ] && continue
+		printf '{"dev":"%s","link":%s,%s}\n' $dev "$(cat /sys/class/net/$dev/carrier 2>/dev/null || echo 0)" "$(counters $dev)"
+	done | join
+	printf '],"wired":[%s],' "$(wired | join)"
+
+	if [ $r = router ]; then printf '"hosts":[%s]}\n' "$(hosts | join)"; else printf '"hosts":[]}\n'; fi
+}
+
+case "$1" in
+stats) stats ;;
+token) token ;;
+*)     sed -n '2,14p' "$0"; exit 1 ;;
+esac

@@ -20,17 +20,35 @@ for f in target/linux/ipq40xx/image/generic.mk package/firmware/ipq-wifi/Makefil
   [ -n "$f" ] && [ -e "$T/$f" ] && git -C "$T" checkout -q -- "$f" 2>/dev/null || true
 done
 
+# 0b. upstream fixes on top of the release tag, from upstream-picks-<tag> (see that file). Only for a
+#     tree sitting on a tag that has a picks file -- the bring-up tree on main has none.
+BASE_TAG=$(git -C "$T" describe --tags --abbrev=0 2>/dev/null || true)
+if [ -n "$BASE_TAG" ] && [ -s "$S/upstream-picks-$BASE_TAG" ]; then
+  while read -r sha subject; do
+    case "$sha" in ''|\#*) continue ;; esac
+    if git -C "$T" log --format=%B "$BASE_TAG..HEAD" | grep -q "cherry picked from commit $sha"; then
+      echo "upstream pick present: $subject"; continue
+    fi
+    git -C "$T" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$T" fetch -q --depth=2 origin "$sha"
+    if ! git -C "$T" -c user.name=neon-release -c user.email=release@neon.invalid cherry-pick -x "$sha" >/dev/null; then
+      git -C "$T" cherry-pick --abort 2>/dev/null; echo "!! upstream pick does not apply: $sha $subject"; exit 1
+    fi
+    echo "upstream pick applied: $subject"
+  done < "$S/upstream-picks-$BASE_TAG"
+fi
+
 # 1. DTS, device stanzas, board files
 cp $S/qcom-ipq4019-mh7021.dts $DTSDIR/
 grep -q "Device/motorola_mh7021" $T/target/linux/ipq40xx/image/generic.mk || \
   cat $S/generic.mk.snippet >> $T/target/linux/ipq40xx/image/generic.mk
 cp $W/board-motorola_mh7021.qca4019 $W/board-motorola_mh7021.qca9888 $T/package/firmware/ipq-wifi/
 
-# 2. rootfs overlay (files/ is entirely ours: status light, neon-role, neon-watchdog, neon-ota + its LuCI page,
+# 2. rootfs overlay (files/ is entirely ours: status light, neon-role, neon-watchdog, neon-ota + neon-node/neon-fleet
+#    and the Overview Mesh section,
 #    uci-defaults, keep.d;
 #    release.sh adds the generated /etc/neon-release and /etc/apk/repositories.d/neon.list afterwards)
 rm -rf $T/files; mkdir -p $T/files && cp -R $S/files/. $T/files/
-find $T/files -type f \( -path '*/usr/sbin/*' -o -path '*/etc/init.d/*' -o -path '*/etc/uci-defaults/*' -o -name diag.sh \) -exec chmod 755 {} +
+find $T/files -type f \( -path '*/usr/sbin/*' -o -path '*/www/cgi-bin/*' -o -path '*/etc/init.d/*' -o -path '*/etc/uci-defaults/*' -o -name diag.sh \) -exec chmod 755 {} +
 
 # 3. third-party packages: luci-theme-aurora, vendored at a pinned commit (luci-theme-aurora/VENDORED.md).
 #    Dropped straight into package/ -- OpenWrt scans that tree recursively -- rather than added as a feed,
@@ -116,10 +134,11 @@ awk '/motorola,mh7021/{f=1} f&&/ucidef_set_interfaces/{print "02_network action:
 grep -n -A3 "motorola,mh7021)" $T/target/linux/ipq40xx/base-files/etc/board.d/02_network | sed "s/^/setup_macs: /"
 if [ -n "$ENVF" ]; then echo "uboot-envtools entry (expect 1): $(grep -c 'motorola,mh7021' $ENVF) in ${ENVF#$T/}"; else echo "uboot-envtools: NO ipq40xx config file found in this tree"; fi
 grep -c "motorola,mh7021" $T/target/linux/ipq40xx/base-files/etc/board.d/01_leds | sed "s/^/01_leds mentions (expect 0): /"
-for f in usr/sbin/neon-led usr/sbin/neon-role usr/sbin/neon-watchdog usr/sbin/neon-ota etc/init.d/neon-led etc/init.d/neon-watchdog etc/init.d/neon-ota etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/diag.sh etc/config/neon_led etc/config/neon_ota www/luci-static/resources/view/neon/ota.js usr/share/luci/menu.d/luci-app-neon-ota.json usr/share/rpcd/acl.d/luci-app-neon-ota.json; do
+for f in usr/sbin/neon-led usr/sbin/neon-role usr/sbin/neon-watchdog usr/sbin/neon-ota usr/sbin/neon-node usr/sbin/neon-fleet www/cgi-bin/neon-node etc/init.d/neon-led etc/init.d/neon-watchdog etc/init.d/neon-ota etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/diag.sh etc/config/neon_led etc/config/neon_ota www/luci-static/resources/view/neon/ota.js usr/share/luci/menu.d/luci-app-neon-ota.json usr/share/rpcd/acl.d/luci-app-neon-ota.json www/luci-static/resources/view/status/include/05_neon_mesh.js usr/share/rpcd/acl.d/luci-app-neon-mesh.json; do
   [ -e $T/files/$f ] && echo "overlay ok: $f" || echo "overlay MISSING: $f"
 done
 for f in Makefile ucode/template/themes/aurora/header.ut htdocs/luci-static/aurora/main.css htdocs/luci-static/resources/menu-aurora.js root/etc/uci-defaults/30_luci-theme-aurora; do
   [ -e $T/package/luci-theme-aurora/$f ] && echo "aurora ok: $f" || echo "aurora MISSING: $f"
 done
+git -C $T log --oneline "$BASE_TAG..HEAD" 2>/dev/null | sed 's/^/picked: /'
 git -C $T status --short | sed 's/^/git: /'

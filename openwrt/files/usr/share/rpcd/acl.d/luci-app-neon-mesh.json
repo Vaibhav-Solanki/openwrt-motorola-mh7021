@@ -1,0 +1,10 @@
+{
+	"luci-app-neon-mesh": {
+		"description": "Grant access to the Mesh section of Status -> Overview",
+		"read": {
+			"file": {
+				"/usr/sbin/neon-fleet stats": [ "exec" ]
+			}
+		}
+	}
+}

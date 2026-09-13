@@ -1,0 +1,24 @@
+#!/bin/sh
+# LAN endpoint for /usr/sbin/neon-node:
+#   GET ?stats    this unit's view of the mesh (JSON); needs "Authorization: Bearer <token>" (see neon-node),
+#                 used by neon-fleet on the unit that renders the Overview "Mesh" section
+#   GET ?whoami   the caller's own address, no token -- lets that section mark "your device"
+# uhttpd binds to the LAN address only.
+
+reply() {	# reply <status> <json>
+	printf 'Status: %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n%s\n' "$1" "$2"
+	exit 0
+}
+[ "$REQUEST_METHOD" = GET ] || reply "405 Method Not Allowed" '{"error":"GET only"}'
+
+case "$QUERY_STRING" in
+whoami)
+	reply "200 OK" "{\"ip\":\"$(printf '%s' "$REMOTE_ADDR" | tr -cd '0-9a-fA-F.:')\"}" ;;
+stats)
+	tok=$(/usr/sbin/neon-node token) || reply "503 Service Unavailable" '{"error":"this unit has no mesh key"}'
+	[ "$HTTP_AUTHORIZATION" = "Bearer $tok" ] || reply "403 Forbidden" '{"error":"missing or wrong token"}'
+	printf 'Status: 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n'
+	exec /usr/sbin/neon-node stats ;;
+*)
+	reply "404 Not Found" '{"error":"unknown request"}' ;;
+esac

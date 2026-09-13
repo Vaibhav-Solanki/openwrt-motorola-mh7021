@@ -1,0 +1,51 @@
+#!/bin/sh
+# neon-fleet -- every reachable unit's view of the mesh in one JSON document, for the "Mesh" section of
+# LuCI Status -> Overview. Runs on any unit. busybox sh.
+#
+#   neon-fleet stats   {"self":<this unit's LAN address>,"nodes":[<neon-node stats of each unit that answered>]}
+#
+# Units are the neon-role address plan: the base at <net>.1, satellite N at <net>.(1+N) for N = 1..SAT_MAX
+# (SAT_MAX from /etc/neon/tunables, default 3; raise it and a new satellite appears). Units that do not
+# answer are left out rather than shown as missing, and are re-probed every 30 s instead of on every
+# refresh, so an unused address in the plan costs nothing.
+
+W=/tmp/neon-fleet
+SAT_MAX=3
+RETRY=30
+[ -r /etc/neon/tunables ] && . /etc/neon/tunables
+
+mkdir -p $W
+ip=$(uci -q get network.lan.ipaddr)
+net=${ip%.*}
+now=$(cut -d. -f1 /proc/uptime)
+
+units() { local n=1; echo "$net.1"; while [ $n -le $SAT_MAX ]; do echo "$net.$((n + 1))"; n=$((n + 1)); done; }
+
+stats() {
+	local u t down
+	t=$(/usr/sbin/neon-node token) || { echo '{"error":"this unit has no mesh key"}'; return 1; }
+	for u in $(units); do
+		rm -f $W/$u.json
+		if [ "$u" = "$ip" ]; then
+			/usr/sbin/neon-node stats > $W/$u.json &
+			continue
+		fi
+		down=$(cat $W/$u.down 2>/dev/null || echo -999)
+		[ $((now - down)) -lt $RETRY ] && continue
+		{
+			uclient-fetch -q -T 3 --header "Authorization: Bearer $t" -O $W/$u.json "http://$u/cgi-bin/neon-node?stats" 2>/dev/null \
+				&& rm -f $W/$u.down || echo $now > $W/$u.down
+		} &
+	done
+	wait
+	printf '{"self":"%s","nodes":[' "$ip"
+	for u in $(units); do
+		[ -s $W/$u.json ] && [ -n "$(jsonfilter -i $W/$u.json -e '@.schema' 2>/dev/null)" ] && tr -d '\n' < $W/$u.json && echo
+	done | awk 'NR > 1 { printf "," } { printf "%s", $0 }'
+	printf ']}\n'
+}
+
+case "$1" in
+stats) stats ;;
+*)     sed -n '2,12p' "$0"; exit 1 ;;
+esac

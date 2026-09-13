@@ -55,7 +55,8 @@ mesh backhaul on the dedicated QCA9888 radio.
 | `openwrt/config.seed` | build config: both profiles, signing, versioning |
 | `openwrt/build.sh`, `release.sh` | build / sign / verify / publish a tagged release |
 | `openwrt/ota-promote.sh`, `openwrt/nginx/` | sign an OTA channel manifest for a published release; serve releases from nginx |
-| `openwrt/files/` | rootfs overlay: `neon-role`, `neon-led`, `neon-watchdog`, `neon-ota` + its LuCI page |
+| `openwrt/files/` | rootfs overlay: `neon-role`, `neon-led`, `neon-watchdog`, `neon-ota` + its LuCI page, `neon-node`/`neon-fleet` + the Overview Mesh section |
+| `openwrt/upstream-picks-v25.12.5` | upstream OpenWrt fixes `apply.sh` cherry-picks onto the release tag (e.g. hostapd advisory 2026-1) |
 | `openwrt/luci-theme-aurora/` | vendored [luci-theme-aurora](https://github.com/eamonxg/luci-theme-aurora) (Apache-2.0) at a pinned commit — the default LuCI skin; provenance and a known cosmetic bug in its `VENDORED.md` |
 | `ipq-wifi/*.json` | board-file manifests (see [Board files](#board-files)) |
 | `tools/` | flashing, dumping, rollout and soak tooling |
@@ -134,10 +135,25 @@ neon-role status
 
 Fleet defaults live at the top of the script and can be overridden per unit in
 `/etc/neon/tunables`, which survives `sysupgrade`. Secrets are arguments only, never stored.
+`neon-role apply` keeps a unit's current hostname; set `NEON_HOSTNAME` in tunables to pin one.
 
 `neon-led` drives the RGB status LED from actual state (mesh peer present, gateway
 reachable, internet reachable, link quality), and `neon-watchdog` gives a console-less
 satellite an automatic rollback if it boots unhealthy.
+
+## Mesh overview
+
+**Status → Overview** opens with a live map of the mesh: internet, main node and satellites in the
+order traffic actually flows, each link coloured by signal quality with animated flow (blue towards
+devices, amber towards the internet, faster with more traffic). Cards show each node's live
+download/upload and device count; *This node* marks the unit whose LuCI you are on and *You* the node
+your own device is connected to. Below it, every connected device with the node it is on, its band,
+signal, link rate and live traffic — click a node to filter. Units that do not answer are not drawn.
+
+Each unit serves its own view on the LAN (`/cgi-bin/neon-node?stats`, authorised with a token derived
+from the mesh key every unit already has, so there is nothing to configure), and the unit rendering the
+page gathers them (`neon-fleet stats`). Units are found by the `neon-role` address plan; raise
+`SAT_MAX` in `/etc/neon/tunables` for more than three satellites.
 
 ## Over-the-air updates
 

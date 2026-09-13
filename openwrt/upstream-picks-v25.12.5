@@ -1,0 +1,5 @@
+# Upstream OpenWrt fixes cherry-picked onto the v25.12.5 release tree by apply.sh (release builds only).
+# One commit per line: <full sha from openwrt-25.12> <subject>. apply.sh fetches each commit (plus its
+# parent, the tree is a shallow clone), cherry-picks it with -x, and skips it on later runs by looking
+# for the "(cherry picked from commit <sha>)" line. Kernel and kmod-vermagic changes do not belong here.
+95e72dc9180d33334e026ae1a96a07e1b12237c2 hostapd: fix security advisory 2026-1
