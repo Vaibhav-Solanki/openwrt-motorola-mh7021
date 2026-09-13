@@ -1,0 +1,13 @@
+{
+	"admin/system/neon-ota": {
+		"title": "Firmware OTA",
+		"order": 71,
+		"action": {
+			"type": "view",
+			"path": "neon/ota"
+		},
+		"depends": {
+			"acl": [ "luci-app-neon-ota" ]
+		}
+	}
+}

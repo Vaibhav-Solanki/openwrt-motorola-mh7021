@@ -2,8 +2,9 @@
 # neon-mesh release build: patch set -> config.seed -> keys -> identity files -> signed images + feed
 # -> verification -> publish. Run ON NEON (Docker, like build_mh7021.sh):
 #     T=~/lab/owrt/openwrt-25.12 TAG=neon-mesh-v1.0.0-rc1 ~/lab/owrt/mh7021/release.sh
-# Env: T (tree, default the 25.12 worktree), TAG (required), JOBS (12), FEED_URL (where the release
-# dir will be served from), SKIP_BUILD=1 (verify + publish an existing build only).
+# Env: T (tree, default the 25.12 worktree), TAG (required), JOBS (12), PUBURL (public base the fleet
+# reads, default https://ujjain.today/neon-mesh), FEED_URL (this release's feed, default $PUBURL/$TAG),
+# PUBROOT (the directory nginx serves PUBURL from), SKIP_BUILD=1 (verify + publish an existing build only).
 # Keys live in ~/lab/owrt/keys (never in a tree, never in git) and are symlinked into the tree root:
 # key-build(.pub/.ucert) = usign/ucert image + sha256sums signing, private/public-key.pem = apk feed
 # index signing. If they are missing they are generated once, inside the container, then kept.
@@ -13,14 +14,21 @@
 #   files/etc/opkg/keys/<usign fingerprint> `sysupgrade -T` verifies the embedded ucert with it
 #   (apk builds of 25.12 install only the apk key; lib/upgrade/fwtool.sh still reads /etc/opkg/keys)
 # Outputs: ~/lab/releases/neon-mesh/$TAG/ (mirrors the official downloads layout so the apk feed URLs
-# look like OpenWrt's own) + the `latest` symlink. Log of the build itself: $T/build-$TAG.log
+# look like OpenWrt's own) + the `latest` symlink, and the same minus the ImageBuilder tarball in
+# $PUBROOT/$TAG/, which the host nginx serves as $PUBURL (nginx/neon-mesh.conf). Publishing does not
+# touch the OTA channels: ota-promote.sh is the separate step that sends a release to the fleet.
+# Log of the build itself: $T/build-$TAG.log
 set -e -o pipefail
 T=${T:-~/lab/owrt/openwrt-25.12}; T=$(cd $T && pwd)
 TAG=${TAG:?set TAG=neon-mesh-vX.Y.Z[-rcN]}
 S=~/lab/owrt/mh7021; K=~/lab/owrt/keys; RELROOT=~/lab/releases/neon-mesh; REL=$RELROOT/$TAG
-# 8080 on neon belongs to the example.invalid container (127.0.0.1:8080) and 80 to the host nginx, so the
-# release server gets 8081. The URL is baked into the image (neon.list), so changing it needs a rebuild.
-FEED_URL=${FEED_URL:-http://FEED_HOST:8081/neon-mesh/$TAG}
+# Units read the feed and the OTA manifests over HTTPS from PUBURL, served by a web server from PUBROOT
+# (nginx/neon-mesh.conf, set up once with nginx/install.sh) -- a directory outside the build user's home,
+# which the web server usually cannot enter. Both URLs are baked into the image (neon.list,
+# /etc/config/neon_ota), so changing them needs a rebuild.
+PUBURL=${PUBURL:-https://ujjain.today/neon-mesh}; PUBURL=${PUBURL%/}
+PUBROOT=${PUBROOT:-/srv/neon-releases/neon-mesh}
+FEED_URL=${FEED_URL:-$PUBURL/$TAG}
 JOBS=${JOBS:-12}; NAME=$(basename $T)
 ARCH=arm_cortex-a7_neon-vfpv4; B=$T/bin/targets/ipq40xx/generic
 log() { echo "== $(date '+%F %T') $*"; }
@@ -53,17 +61,21 @@ NEON_OPENWRT_COMMIT=$TREE_COMMIT
 NEON_ROUTER_COMMIT=$ROUTER_COMMIT
 NEON_PROFILES="motorola_mh7021 (ath10k mainline), motorola_mh7021-ct (ath10k-ct)"
 NEON_FEED=$FEED_URL
+NEON_OTA=$PUBURL
 NEON_USIGN_KEY=$($HOSTBIN/usign -F -p $K/key-build.pub 2>/dev/null || echo pending)
 EOT
 cat > $T/files/etc/apk/repositories.d/neon.list <<EOT
 # neon-mesh release feed ($TAG): kmods with this image's vermagic + everything the release built.
-# The official 25.12.5 feeds stay in distfeeds.list. Served by the nginx container on neon (RELEASE.md).
+# The official 25.12.5 feeds stay in distfeeds.list. Served from PUBURL (docs/OTA.md).
 $FEED_URL/targets/ipq40xx/generic/packages/packages.adb
 $FEED_URL/packages/$ARCH/base/packages.adb
 $FEED_URL/packages/$ARCH/luci/packages.adb
 $FEED_URL/packages/$ARCH/packages/packages.adb
 EOT
 cat $T/files/etc/neon-release
+# OTA: the image checks $PUBURL/ota/<channel>.json (neon-ota); apply.sh copied the default config
+sed -i "s|^\(\s*option base_url\).*|\1 '$PUBURL'|" $T/files/etc/config/neon_ota
+grep -q "option base_url '$PUBURL'" $T/files/etc/config/neon_ota || { echo "!! could not set base_url in files/etc/config/neon_ota"; exit 1; }
 # `sysupgrade -T` verifies the embedded ucert against /etc/opkg/keys (lib/upgrade/fwtool.sh), but the
 # apk build of base-files only installs the apk key, so the overlay has to carry the usign one.
 FP=$($HOSTBIN/usign -F -p $K/key-build.pub 2>/dev/null || true)
@@ -175,7 +187,7 @@ RD=$DEV_REL	# release profile's rootfs; files added per device live only here, n
 # -e alone is wrong inside a staged rootfs: alternatives land as absolute symlinks (/usr/bin/scp ->
 # /usr/sbin/dropbear) that resolve on the unit but not against the build host's /, so accept -L too.
 has_path() { [ -n "$1" ] && [ -n "$2" ] && { [ -e "$1/$2" ] || [ -L "$1/$2" ]; }; }	# <rootfs> <path>; empty rootfs = no
-for f in etc/opkg/keys/$($HOSTBIN/usign -F -p $K/key-build.pub) etc/apk/keys/public-key.pem usr/bin/ucert usr/bin/usign usr/bin/fwtool usr/bin/scp usr/sbin/fw_setenv usr/sbin/neon-role usr/sbin/neon-watchdog usr/sbin/neon-led etc/init.d/neon-watchdog etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/neon-release etc/apk/repositories.d/neon.list etc/uci-defaults/30_uboot-envtools; do
+for f in etc/opkg/keys/$($HOSTBIN/usign -F -p $K/key-build.pub) etc/apk/keys/public-key.pem usr/bin/ucert usr/bin/usign usr/bin/fwtool usr/bin/scp usr/sbin/fw_setenv usr/sbin/neon-role usr/sbin/neon-watchdog usr/sbin/neon-led usr/sbin/neon-ota etc/init.d/neon-watchdog etc/init.d/neon-ota etc/rc.d/S99neon-ota etc/config/neon_ota www/luci-static/resources/view/neon/ota.js usr/share/luci/menu.d/luci-app-neon-ota.json usr/share/rpcd/acl.d/luci-app-neon-ota.json etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/neon-release etc/apk/repositories.d/neon.list etc/uci-defaults/30_uboot-envtools; do
   if has_path "$R" "$f" || has_path "$RD" "$f"; then
     echo "   rootfs  /$f"
   else
@@ -183,6 +195,7 @@ for f in etc/opkg/keys/$($HOSTBIN/usign -F -p $K/key-build.pub) etc/apk/keys/pub
   fi
 done
 (cmp -s "$R/etc/apk/keys/public-key.pem" "$K/public-key.pem" || ([ -n "$RD" ] && cmp -s "$RD/etc/apk/keys/public-key.pem" "$K/public-key.pem")) && echo "   rootfs  /etc/apk/keys/public-key.pem = keys/public-key.pem" || fail "apk public key in rootfs differs from keys/"
+(grep -q "option base_url '$PUBURL'" "$R/etc/config/neon_ota" 2>/dev/null || ([ -n "$RD" ] && grep -q "option base_url '$PUBURL'" "$RD/etc/config/neon_ota" 2>/dev/null)) && echo "   rootfs  neon_ota base_url = $PUBURL" || fail "rootfs /etc/config/neon_ota does not point at $PUBURL"
 (grep -q "motorola,mh7021" "$R/etc/uci-defaults/30_uboot-envtools" 2>/dev/null || ([ -n "$RD" ] && grep -q "motorola,mh7021" "$RD/etc/uci-defaults/30_uboot-envtools" 2>/dev/null)) && echo "   rootfs  uboot-envtools knows motorola,mh7021" || fail "uboot-envtools config lacks motorola,mh7021"
 # signatures: embedded ucert in every sysupgrade image, detached usign on sha256sums
 for img in "$REL_IMG" "$CT_IMG"; do
@@ -218,6 +231,14 @@ cp $T/.config $REL/config.full; cp $S/config.seed $REL/config.seed
 ln -sfn $TAG $RELROOT/latest
 cat $REL/RELEASE.txt
 du -sh $REL
-docker ps --format '{{.Names}}' | grep -q '^neon-releases$' && log "served at $FEED_URL/" || \
-  log "release server not running -- start it once (user): docker run -d --restart unless-stopped --name neon-releases -p 8081:80 -v $HOME/lab/releases:/usr/share/nginx/html:ro nginx:alpine"
-log "done"
+# public copy: everything a unit or a person needs, without the 110 MB ImageBuilder
+if [ -d "$PUBROOT" ] && [ -w "$PUBROOT" ]; then
+  log "publish -> $PUBROOT/$TAG ($PUBURL/$TAG/)"
+  rsync -a --delete --exclude '*imagebuilder*' $REL/ $PUBROOT/$TAG/
+  ln -sfn $TAG $PUBROOT/latest
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$FEED_URL/targets/ipq40xx/generic/sha256sums" || true)
+  [ "$code" = 200 ] && log "served at $FEED_URL/" || log "WARNING: $FEED_URL/targets/ipq40xx/generic/sha256sums answers HTTP $code -- nginx/install.sh done?"
+else
+  log "WARNING: $PUBROOT missing or not writable -- run nginx/install.sh once (user, sudo); units on $TAG cannot reach their feed until then"
+fi
+log "done -- to send $TAG to the fleet: TAG=$TAG $S/ota-promote.sh"

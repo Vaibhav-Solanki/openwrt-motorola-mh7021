@@ -1,0 +1,309 @@
+#!/bin/sh
+# neon-ota -- over-the-air firmware updates for an MH7021 in the neon mesh (busybox sh).
+#
+#   neon-ota check   [--json]                 fetch + verify the channel manifest; is a newer release out?
+#   neon-ota upgrade [--yes] [--dry-run] [--detach] [--json]
+#                                             download, verify, flash (settings kept); --detach returns
+#                                             at once and reports progress through `status`
+#   neon-ota status  [--json]                 config, running release, last check, last upgrade
+#   neon-ota cron                             run by crond every 10 min: periodic check, and auto-install
+#                                             inside this unit's slot when auto_install=1
+#   neon-ota boot                             run by /etc/init.d/neon-ota: cron entry + post-upgrade report
+#
+# Config: /etc/config/neon_ota (LuCI: System -> Firmware OTA). Manifest: <base_url>/ota/<channel>.json
+# plus a detached usign signature (.sig), written on the build host by ota-promote.sh (docs/OTA.md).
+#
+# Trust: the manifest is verified with usign against /etc/opkg/keys -- the key-build key that also signs
+# the images -- before any field in it is used, and the downloaded image must match the size and sha256
+# the manifest names; sysupgrade -T then checks the board and the image's own embedded signature.
+# Only a strictly newer release is ever installed: a manifest cannot downgrade a unit.
+# No rollback image is staged: the image lives in /tmp only (a second ~10 MB image in /etc/neon fills
+# the 17.7 MiB overlay and starves the first boot after the upgrade).
+# Fleet order: satellite N installs in slot N (window_start + (N-1)*slot_minutes), the router one slot
+# after the last satellite, so the mesh root and the internet go last.
+
+CONF=neon_ota
+W=/tmp/neon-ota
+KEYDIR=${NEON_OTA_KEYDIR:-/etc/opkg/keys}
+LAST=/etc/neon/ota-last
+SAT_MAX=3
+CRON_LINE='*/10 * * * * /usr/sbin/neon-ota cron'
+
+. /usr/share/libubox/jshn.sh
+
+log() { logger -t neon-ota -p daemon.notice "$*"; [ -n "$QUIET" ] || echo "neon-ota: $*" >&2; }
+progress() { mkdir -p $W; echo "$1|$2" > $W/progress; }	# what an install is doing, for status/LuCI
+u() { uci -q get $CONF.main.$1; }
+
+load_config() {
+	ENABLED=$(u enabled);            ENABLED=${ENABLED:-0}
+	AUTO=$(u auto_install);          AUTO=${AUTO:-0}
+	BASE=$(u base_url);              BASE=${BASE%/}
+	CHANNEL=$(u channel);            CHANNEL=${CHANNEL:-stable}
+	WINDOW=$(u window_start);        WINDOW=${WINDOW:-03:00}
+	SLOT=$(u slot_minutes);          SLOT=${SLOT:-20}
+	CHECK_HOURS=$(u check_hours);    CHECK_HOURS=${CHECK_HOURS:-6}
+	CUR_REL=$(sed -n 's/^NEON_RELEASE=//p' /etc/neon-release 2>/dev/null)
+	[ -e /lib/apk/packages/kmod-ath10k-ct.list ] && PROFILE=motorola_mh7021-ct || PROFILE=motorola_mh7021
+	BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+}
+
+# neon-mesh-v1.2.0 -> 1002000999, neon-mesh-v1.2.0-rc3 -> 1002000003 (an rc sorts below its final);
+# anything else (the legacy bring-up image) -> 0
+ver_key() {
+	echo "$1" | awk '{
+		s = $0; if (!sub(/^.*-v/, "", s)) { print 0; exit }
+		rc = 999; if (match(s, /-rc[0-9]+$/)) { rc = substr(s, RSTART + 3) + 0; s = substr(s, 1, RSTART - 1) }
+		if (split(s, a, ".") != 3) { print 0; exit }
+		printf "%d%03d%03d%03d\n", a[1], a[2], a[3], rc }'
+}
+newer() { awk -v a="$(ver_key "$1")" -v b="$(ver_key "$2")" 'BEGIN { exit !(a + 0 > b + 0) }'; }	# newer <a> <b>: a > b
+
+role_offset() {	# -> ROLE, OFFSET (minutes after window_start that this unit's slot opens)
+	local ip n
+	if [ -n "$(uci -q get network.wan)" ]; then
+		ROLE=router; OFFSET=$((SAT_MAX * SLOT))
+	else
+		ip=$(uci -q get network.lan.ipaddr); n=$(( ${ip##*.} - 1 ))
+		[ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le $SAT_MAX ] || n=1
+		ROLE="satellite $n"; OFFSET=$(((n - 1) * SLOT))
+	fi
+}
+in_slot() {	# awk, because busybox sh arithmetic reads "08" as bad octal
+	awk -v w="$WINDOW" -v n="$(date +%H:%M)" -v o="$OFFSET" -v s="$SLOT" 'BEGIN { split(w, a, ":"); split(n, b, ":")
+		start = (a[1] * 60 + a[2] + o) % 1440; now = b[1] * 60 + b[2]
+		exit !((now - start + 1440) % 1440 < s) }'
+}
+slot_text() {
+	awk -v w="$WINDOW" -v o="$OFFSET" -v s="$SLOT" 'BEGIN { split(w, a, ":"); t = (a[1] * 60 + a[2] + o) % 1440
+		printf "%02d:%02d-%02d:%02d", t / 60, t % 60, ((t + s) % 1440) / 60, (t + s) % 60 }'
+}
+
+fetch() {	# fetch <url> <file>; on failure FETCH_ERR says why
+	local rc
+	rm -f "$2"
+	# no -q: quiet mode also hides the reason ("HTTP error 404", "Connection error: ..."), which is
+	# exactly what a failed check needs to show; the exit code is the fallback (wget's numbering)
+	uclient-fetch -T 30 -O "$2" "$1" 2>"$W/fetch.err"; rc=$?
+	[ $rc = 0 ] && [ -s "$2" ] && return 0
+	FETCH_ERR=$(grep -E 'HTTP error|Connection error|[Ff]ailed|timed out' "$W/fetch.err" 2>/dev/null | tail -n 1)
+	[ -n "$FETCH_ERR" ] || case $rc in
+		0) FETCH_ERR="empty response" ;;
+		4) FETCH_ERR="network error (DNS, route or connection)" ;;
+		5) FETCH_ERR="TLS certificate rejected -- is the clock set?" ;;
+		8) FETCH_ERR="the server answered with an HTTP error" ;;
+		*) FETCH_ERR="uclient-fetch exit $rc" ;;
+	esac
+	rm -f "$2"; return 1
+}
+
+# ---------------------------------------------------------------- check
+# -> RESULT (update|current|error), MSG, and on success NEW_REL NEW_PUB IMG_URL IMG_SHA IMG_SIZE NOTES_URL
+check() {
+	local m=$W/manifest.json ch board
+	RESULT=error; NEW_REL=""; NEW_PUB=""; IMG_URL=""; IMG_SHA=""; IMG_SIZE=""; NOTES_URL=""
+	mkdir -p $W
+	[ -n "$BASE" ] || { MSG="no base_url configured"; return 1; }
+	if ! fetch "$BASE/ota/$CHANNEL.json" $m.new; then
+		MSG="cannot fetch $BASE/ota/$CHANNEL.json: $FETCH_ERR"
+		case "$FETCH_ERR" in *404*) MSG="$MSG -- no release has been promoted to channel '$CHANNEL' yet" ;; esac
+		return 1
+	fi
+	fetch "$BASE/ota/$CHANNEL.json.sig" $m.new.sig || { MSG="cannot fetch the manifest signature: $FETCH_ERR"; return 1; }
+	usign -V -q -m $m.new -x $m.new.sig -P "$KEYDIR" 2>/dev/null || { MSG="manifest signature does NOT verify against $KEYDIR -- ignored"; rm -f $m.new $m.new.sig; return 1; }
+	mv $m.new $m; mv $m.new.sig $m.sig
+	eval "$(jsonfilter -i $m -e 'schema=@.schema' -e 'ch=@.channel' -e 'board=@.board' -e 'NEW_REL=@.release' \
+		-e 'NEW_PUB=@.published' -e 'NOTES_URL=@.notes' -e "IMG_PATH=@.images['$PROFILE'].path" \
+		-e "IMG_SHA=@.images['$PROFILE'].sha256" -e "IMG_SIZE=@.images['$PROFILE'].size" 2>/dev/null)"
+	[ "$schema" = 1 ] || { MSG="manifest schema '$schema' not understood by this neon-ota"; return 1; }
+	[ "$ch" = "$CHANNEL" ] || { MSG="manifest is for channel '$ch', not '$CHANNEL'"; return 1; }
+	[ "$board" = "$BOARD" ] || { MSG="manifest is for board '$board', this is '$BOARD'"; return 1; }
+	[ -n "$NEW_REL" ] && [ -n "$IMG_PATH" ] && [ -n "$IMG_SHA" ] && [ -n "$IMG_SIZE" ] || { MSG="manifest has no $PROFILE image for $NEW_REL"; return 1; }
+	case "$IMG_PATH" in *..*|/*) MSG="manifest image path '$IMG_PATH' rejected"; return 1 ;; esac
+	IMG_URL="$BASE/$IMG_PATH"; [ -n "$NOTES_URL" ] && NOTES_URL="$BASE/$NOTES_URL"
+	date +%s > $W/last-check
+	if newer "$NEW_REL" "$CUR_REL"; then
+		RESULT=update; MSG="$NEW_REL is available (running ${CUR_REL:-unknown})"
+	else
+		RESULT=current; MSG="up to date: running ${CUR_REL:-unknown}, channel $CHANNEL offers $NEW_REL"
+	fi
+	echo "$RESULT $NEW_REL" > $W/last-result
+	return 0
+}
+
+# ---------------------------------------------------------------- upgrade
+# /etc/neon/ota-last (kept across sysupgrade with the rest of /etc/neon): one key=value per line, read
+# without eval -- `result` can carry neon-watchdog's text
+read_last() {
+	from=""; to=""; at=""; by=""; result=""
+	[ -s $LAST ] || return 1
+	while IFS='=' read -r k v; do
+		case "$k" in from) from=$v ;; to) to=$v ;; at) at=$v ;; by) by=$v ;; result) result=$v ;; esac
+	done < $LAST
+}
+write_last() {
+	mkdir -p "${LAST%/*}"
+	printf 'from=%s\nto=%s\nat=%s\nby=%s\nresult=%s\n' "$from" "$to" "$at" "$by" "$result" > $LAST.new && mv $LAST.new $LAST
+}
+precheck() {
+	local mem tmp
+	[ "$BOARD" = "motorola,mh7021" ] || { MSG="not an MH7021 ($BOARD)"; return 1; }
+	mem=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)
+	tmp=$(df -k /tmp | awk 'NR == 2 { print int($4 / 1024) }')
+	[ "$mem" -ge 40 ] || { MSG="MemAvailable ${mem} MiB < 40"; return 1; }
+	[ "$tmp" -ge $(( IMG_SIZE / 1048576 + 16 )) ] || { MSG="/tmp free ${tmp} MiB too small for a $((IMG_SIZE / 1048576)) MiB image"; return 1; }
+	[ "$(date +%s)" -ge "${NEW_PUB:-0}" ] || { MSG="clock is behind the manifest's publish time -- NTP not synced yet"; return 1; }
+	return 0
+}
+upgrade() {	# upgrade <by>
+	local img=$W/firmware.bin got sha
+	progress checking "fetching the $CHANNEL manifest"
+	check || return 1
+	[ "$RESULT" = update ] || return 0
+	precheck || return 1
+	log "downloading $NEW_REL ($PROFILE, $IMG_SIZE B) for ${1:-manual} upgrade"
+	progress downloading "$NEW_REL, $((IMG_SIZE / 1024)) KiB"
+	neon-led set cyan blink 2>/dev/null
+	fetch "$IMG_URL" $img || { MSG="download failed: $IMG_URL ${FETCH_ERR}"; neon-led resume 2>/dev/null; return 1; }
+	progress verifying "$NEW_REL: sha256 against the signed manifest, then sysupgrade -T"
+	got=$(wc -c < $img); sha=$(sha256sum $img | cut -d' ' -f1)
+	if [ "$got" != "$IMG_SIZE" ] || [ "$sha" != "$IMG_SHA" ]; then
+		MSG="image does not match the signed manifest (size $got/$IMG_SIZE, sha256 ${sha%${sha#????????????}}...) -- discarded"
+		rm -f $img; neon-led resume 2>/dev/null; return 1
+	fi
+	if ! sysupgrade -T $img >$W/sysupgrade-T.log 2>&1; then
+		MSG="sysupgrade -T rejected the image: $(tail -n 3 $W/sysupgrade-T.log | tr '\n' ' ')"
+		rm -f $img; neon-led resume 2>/dev/null; return 1
+	fi
+	if [ -n "$DRYRUN" ]; then
+		MSG="dry run: $NEW_REL downloaded and verified (sha256 + signed manifest + sysupgrade -T), not flashed"
+		rm -f $img; neon-led resume 2>/dev/null; RESULT=verified; return 0
+	fi
+	from=$CUR_REL; to=$NEW_REL; at=$(date +%s); by=${1:-manual}; result=pending
+	write_last; sync
+	log "flashing $NEW_REL over $CUR_REL (settings kept), unit reboots in ~3 min"
+	RESULT=flashing; MSG="flashing $NEW_REL; the unit reboots and is back in about 3 minutes"
+	progress flashing "$NEW_REL"
+	setsid sysupgrade -v $img </dev/null >$W/sysupgrade.log 2>&1 &
+	return 0
+}
+
+# ---------------------------------------------------------------- cron / boot
+cron_run() {
+	local last now attempts
+	[ "$ENABLED" = 1 ] || exit 0
+	mkdir -p $W
+	exec 9>$W/lock; flock -n 9 || exit 0
+	QUIET=1; role_offset; now=$(date +%s)
+	if [ "$AUTO" = 1 ] && in_slot; then
+		check || { log "check failed: $MSG"; exit 1; }
+		[ "$RESULT" = update ] || exit 0
+		attempts=$(cat $W/attempts.$NEW_REL 2>/dev/null || echo 0)
+		[ "$attempts" -lt 2 ] || exit 0			# at most two tries per release per boot
+		echo $((attempts + 1)) > $W/attempts.$NEW_REL
+		neon-watchdog check >/dev/null 2>&1 || { log "not auto-installing $NEW_REL: unit unhealthy ($(neon-watchdog check 2>&1))"; exit 1; }
+		if upgrade "auto ($ROLE slot $(slot_text))"; then progress "$RESULT" "$MSG"; log "$MSG"; exit 0; fi
+		RESULT=error; progress error "$MSG"; log "auto-install of $NEW_REL failed: $MSG"; exit 1
+	fi
+	last=$(cat $W/last-check 2>/dev/null || echo 0)
+	[ $((now - last)) -ge $((CHECK_HOURS * 3600)) ] || exit 0
+	# spread the fleet's checks a little so three units do not hit the server in the same second
+	sleep $(( 0x$(cut -d: -f6 /sys/class/net/br-lan/address 2>/dev/null || echo 0) % 90 ))
+	if check; then [ "$RESULT" = update ] && log "$MSG (auto_install=$AUTO)"; else date +%s > $W/last-check; log "check failed: $MSG"; fi
+}
+boot() {
+	local c=/etc/crontabs/root
+	# the entry stays even when disabled: `cron` reads neon_ota.main.enabled itself, so a LuCI/uci change
+	# needs no service reload
+	mkdir -p /etc/crontabs; touch $c
+	grep -qF '/usr/sbin/neon-ota cron' $c || { echo "$CRON_LINE" >> $c; /etc/init.d/cron restart 2>/dev/null; }
+	read_last && [ "$result" = pending ] || return 0
+	# first boot after an OTA flash: record whether it took and whether the unit came up healthy (10 min)
+	(
+		i=0
+		while [ $i -lt 40 ]; do neon-watchdog check >/dev/null 2>&1 && break; sleep 15; i=$((i + 1)); done
+		if [ "$CUR_REL" != "$to" ]; then result="failed (still running ${CUR_REL:-unknown})"
+		elif neon-watchdog check >/dev/null 2>&1; then result=ok
+		else result="unhealthy: $(neon-watchdog check 2>&1)"; fi
+		write_last
+		QUIET=1 log "upgrade $from -> $to ($by): $result"
+	) </dev/null >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------- output
+out() {	# out <verb>: print the outcome of check/upgrade as text or json
+	if [ -n "$JSON" ]; then
+		json_init
+		json_add_string result "$RESULT"; json_add_string message "$MSG"
+		json_add_string running "$CUR_REL"; json_add_string profile "$PROFILE"
+		json_add_string available "$NEW_REL"; json_add_int published "${NEW_PUB:-0}"
+		json_add_string image "$IMG_URL"; json_add_int size "${IMG_SIZE:-0}"; json_add_string notes "$NOTES_URL"
+		json_dump
+	else
+		echo "$MSG"
+		[ -n "$NOTES_URL" ] && [ "$RESULT" = update ] && echo "notes: $NOTES_URL"
+	fi
+}
+status() {
+	local lc lr now pstate="" pmsg=""
+	role_offset; now=$(date +%s)
+	lc=$(cat $W/last-check 2>/dev/null); lr=$(cat $W/last-result 2>/dev/null)
+	[ -s $W/progress ] && IFS='|' read -r pstate pmsg < $W/progress
+	read_last
+	if [ -n "$JSON" ]; then
+		json_init
+		json_add_boolean enabled "$ENABLED"; json_add_boolean auto_install "$AUTO"
+		json_add_string base_url "$BASE"; json_add_string channel "$CHANNEL"
+		json_add_string running "$CUR_REL"; json_add_string profile "$PROFILE"
+		json_add_string role "$ROLE"; json_add_string slot "$(slot_text)"
+		json_add_int last_check "${lc:-0}"; json_add_string last_result "$lr"
+		json_add_boolean flashing "$(pgrep -f 'sysupgrade -v' >/dev/null && echo 1 || echo 0)"
+		json_add_string progress "$pstate"; json_add_string progress_message "$pmsg"
+		json_add_object last_upgrade
+		json_add_string from "$from"; json_add_string to "$to"; json_add_int at "${at:-0}"
+		json_add_string by "$by"; json_add_string result "$result"
+		json_close_object
+		json_dump
+	else
+		echo "running : ${CUR_REL:-unknown} ($PROFILE)"
+		echo "ota     : enabled=$ENABLED auto_install=$AUTO channel=$CHANNEL base=$BASE"
+		echo "slot    : $ROLE installs at $(slot_text) (window_start $WINDOW, $SLOT min per slot)"
+		if [ -n "$lc" ]; then echo "checked : $(( (now - lc) / 60 )) min ago -> ${lr:-error}"; else echo "checked : not since boot"; fi
+		[ -n "$to" ] && echo "last    : $from -> $to by $by at $(date -d @$at '+%F %T' 2>/dev/null || echo $at): $result"
+		[ -n "$pstate" ] && echo "install : $pstate${pmsg:+ -- $pmsg}"
+		pgrep -f 'sysupgrade -v' >/dev/null && echo "now     : FLASHING"
+	fi
+}
+
+# ---------------------------------------------------------------- main
+cmd=$1; [ $# -gt 0 ] && shift
+JSON=""; YES=""; DRYRUN=""; DETACH=""
+for a in "$@"; do
+	case "$a" in
+	--json) JSON=1; QUIET=1 ;;
+	--yes) YES=1 ;;
+	--dry-run) DRYRUN=1 ;;
+	--detach) DETACH=1 ;;
+	*) echo "neon-ota: unknown option $a" >&2; exit 2 ;;
+	esac
+done
+load_config
+case "$cmd" in
+check)   check; rc=$?; out; exit $rc ;;
+upgrade)
+	[ -n "$YES" ] || [ -n "$DRYRUN" ] || { echo "neon-ota: add --yes to flash (or --dry-run to only download and verify)" >&2; exit 2; }
+	mkdir -p $W
+	if [ -n "$DETACH" ]; then	# LuCI: return at once, progress shows up in `status`
+		pgrep -f 'sysupgrade -v' >/dev/null && { RESULT=error; MSG="already flashing"; out; exit 1; }
+		progress starting "upgrade requested"
+		setsid /usr/sbin/neon-ota upgrade --yes </dev/null >/dev/null 2>&1 &
+		RESULT=started; MSG="upgrade started; follow it with neon-ota status"; out; exit 0
+	fi
+	exec 9>$W/lock; flock -n 9 || { RESULT=error; MSG="another neon-ota run is in progress"; out; exit 1; }
+	upgrade manual; rc=$?; [ $rc = 0 ] || RESULT=error
+	progress "$RESULT" "$MSG"; out; exit $rc ;;
+status)  status ;;
+cron)    cron_run ;;
+boot)    boot ;;
+*)       sed -n '2,23p' "$0"; exit 1 ;;
+esac

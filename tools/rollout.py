@@ -8,7 +8,8 @@ rollout.py -- upgrade one neon-mesh unit to a release image over ssh, safely, an
     python3 router/rollout.py sat1 --dry                    # pre-checks and the plan only, no changes
     python3 router/rollout.py --status                      # fleet summary (all three units)
 
-Images normally come from your release server (set NEON_FEED, e.g. http://buildhost.lan:8081/neon-mesh/<tag>/):
+Images normally come from the release server (https://ujjain.today/neon-mesh/<tag>/...; set NEON_FEED to
+use your own):
 the unit fetches them itself with wget and the sha256 is checked against the release's sha256sums.
 A local file is pushed with scp -O instead. Steps: pre-checks -> stage the new image in /tmp and the
 rollback image in /etc/neon/ -> sysupgrade -T on both (+ an explicit ucert signature check when the
@@ -21,7 +22,7 @@ and the acceptance checks it runs afterwards.
 import argparse, getpass, hashlib, json, os, re, socket, subprocess, sys, tempfile, time, urllib.request
 
 UNITS = {"base": "192.168.0.1", "sat1": "192.168.0.2", "sat2": "192.168.0.3"}
-SERVER = os.environ.get("NEON_FEED", "http://buildhost.lan:8081/neon-mesh")
+SERVER = os.environ.get("NEON_FEED", "https://ujjain.today/neon-mesh").rstrip("/")
 LEGACY = "legacy-main-098e599"
 BOOTCMD = "ping 192.168.0.10; sf probe 0; sf read 0x84000000 0x180000 0x500000; bootm 0x84000000"
 BOARD_CRC = {"20": "17b369b4", "29": "17b369b4", "23": "d6b71c5b"}   # bmi_id -> vendor board file crc32
@@ -108,7 +109,7 @@ def resolve_image(spec, release, variant):
     try:
         sums = http_get(base + "/sha256sums").decode()
     except Exception as e:
-        sys.exit("!! cannot read %s/sha256sums (%s) -- is the neon-releases container running? (RELEASE.md §5)" % (base, e))
+        sys.exit("!! cannot read %s/sha256sums (%s) -- is the release published and served? (docs/OTA.md)" % (base, e))
     want = "-motorola_mh7021-squashfs-sysupgrade.bin" if variant == "mainline" else IMG_GLOB["ct"]
     if release == LEGACY:
         want = "-motorola_mh7021-squashfs-sysupgrade.bin"

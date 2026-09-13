@@ -54,12 +54,14 @@ mesh backhaul on the dedicated QCA9888 radio.
 | `openwrt/apply.sh` | idempotent patch set applied to an OpenWrt tree |
 | `openwrt/config.seed` | build config: both profiles, signing, versioning |
 | `openwrt/build.sh`, `release.sh` | build / sign / verify / publish a tagged release |
-| `openwrt/files/` | rootfs overlay: `neon-role`, `neon-led`, `neon-watchdog` |
+| `openwrt/ota-promote.sh`, `openwrt/nginx/` | sign an OTA channel manifest for a published release; serve releases from nginx |
+| `openwrt/files/` | rootfs overlay: `neon-role`, `neon-led`, `neon-watchdog`, `neon-ota` + its LuCI page |
 | `openwrt/luci-theme-aurora/` | vendored [luci-theme-aurora](https://github.com/eamonxg/luci-theme-aurora) (Apache-2.0) at a pinned commit — the default LuCI skin; provenance and a known cosmetic bug in its `VENDORED.md` |
 | `ipq-wifi/*.json` | board-file manifests (see [Board files](#board-files)) |
 | `tools/` | flashing, dumping, rollout and soak tooling |
 | `docs/HARDWARE.md` | hardware reference — the part that took longest to establish |
 | `docs/MESH-TUNING.md` | measured mesh tuning: TX power and channel width |
+| `docs/OTA.md` | over-the-air updates and the release server |
 | `data/` | raw measurement data behind the tuning doc |
 
 ## Hardware
@@ -94,7 +96,8 @@ T=/path/to/openwrt TAG=myrelease-v1.0.0 ./openwrt/release.sh
 package index, verifies the result (board-file sizes, FIT size limits, per-profile package
 manifests, signature chains) and publishes a feed laid out like `downloads.openwrt.org`.
 
-Set `FEED_HOST` to the host serving your package feed. Secrets are never stored in this
+Releases are published for units to fetch at `PUBURL` (default `https://ujjain.today/neon-mesh`;
+set your own when you build — it is baked into the image). Secrets are never stored in this
 repo: keys live outside the tree, and passwords are passed as arguments or environment
 variables (`NEON_ROOTPW`, `NEON_FEED`).
 
@@ -135,6 +138,23 @@ Fleet defaults live at the top of the script and can be overridden per unit in
 `neon-led` drives the RGB status LED from actual state (mesh peer present, gateway
 reachable, internet reachable, link quality), and `neon-watchdog` gives a console-less
 satellite an automatic rollback if it boots unhealthy.
+
+## Over-the-air updates
+
+From v1.2.0 each unit runs `neon-ota` and has **System → Firmware OTA** in LuCI. Publishing a
+release does nothing by itself; `openwrt/ota-promote.sh` signs a channel manifest with the image
+signing key, and units then offer — or, with `auto_install` on, install in a maintenance
+window, satellites before the router — any **newer** release on their channel:
+
+```sh
+neon-ota status          # running release, channel, install slot, last upgrade
+neon-ota check           # is a newer release published?
+neon-ota upgrade --yes   # download, verify, flash (settings kept)
+```
+
+The manifest is verified with `usign` before use, the image must match its sha256 and pass
+`sysupgrade -T`, and nothing is ever downgraded. Automatic install is **off** in the image.
+Details, the release-server setup and the limits: [`docs/OTA.md`](docs/OTA.md).
 
 ## Mesh tuning
 

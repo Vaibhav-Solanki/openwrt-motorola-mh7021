@@ -26,7 +26,8 @@ grep -q "Device/motorola_mh7021" $T/target/linux/ipq40xx/image/generic.mk || \
   cat $S/generic.mk.snippet >> $T/target/linux/ipq40xx/image/generic.mk
 cp $W/board-motorola_mh7021.qca4019 $W/board-motorola_mh7021.qca9888 $T/package/firmware/ipq-wifi/
 
-# 2. rootfs overlay (files/ is entirely ours: status light, neon-role, neon-watchdog, uci-defaults, keep.d;
+# 2. rootfs overlay (files/ is entirely ours: status light, neon-role, neon-watchdog, neon-ota + its LuCI page,
+#    uci-defaults, keep.d;
 #    release.sh adds the generated /etc/neon-release and /etc/apk/repositories.d/neon.list afterwards)
 rm -rf $T/files; mkdir -p $T/files && cp -R $S/files/. $T/files/
 find $T/files -type f \( -path '*/usr/sbin/*' -o -path '*/etc/init.d/*' -o -path '*/etc/uci-defaults/*' -o -name diag.sh \) -exec chmod 755 {} +
@@ -115,7 +116,7 @@ awk '/motorola,mh7021/{f=1} f&&/ucidef_set_interfaces/{print "02_network action:
 grep -n -A3 "motorola,mh7021)" $T/target/linux/ipq40xx/base-files/etc/board.d/02_network | sed "s/^/setup_macs: /"
 if [ -n "$ENVF" ]; then echo "uboot-envtools entry (expect 1): $(grep -c 'motorola,mh7021' $ENVF) in ${ENVF#$T/}"; else echo "uboot-envtools: NO ipq40xx config file found in this tree"; fi
 grep -c "motorola,mh7021" $T/target/linux/ipq40xx/base-files/etc/board.d/01_leds | sed "s/^/01_leds mentions (expect 0): /"
-for f in usr/sbin/neon-led usr/sbin/neon-role usr/sbin/neon-watchdog etc/init.d/neon-led etc/init.d/neon-watchdog etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/diag.sh etc/config/neon_led; do
+for f in usr/sbin/neon-led usr/sbin/neon-role usr/sbin/neon-watchdog usr/sbin/neon-ota etc/init.d/neon-led etc/init.d/neon-watchdog etc/init.d/neon-ota etc/uci-defaults/50-neon-mesh lib/upgrade/keep.d/neon-mesh etc/diag.sh etc/config/neon_led etc/config/neon_ota www/luci-static/resources/view/neon/ota.js usr/share/luci/menu.d/luci-app-neon-ota.json usr/share/rpcd/acl.d/luci-app-neon-ota.json; do
   [ -e $T/files/$f ] && echo "overlay ok: $f" || echo "overlay MISSING: $f"
 done
 for f in Makefile ucode/template/themes/aurora/header.ut htdocs/luci-static/aurora/main.css htdocs/luci-static/resources/menu-aurora.js root/etc/uci-defaults/30_luci-theme-aurora; do

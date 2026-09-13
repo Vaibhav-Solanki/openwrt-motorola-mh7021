@@ -1,0 +1,14 @@
+# neon-ota: over-the-air firmware updates (/usr/sbin/neon-ota, LuCI: System -> Firmware OTA).
+# enabled       check the release server every check_hours (needs no action; logs when a release is out)
+# auto_install  also install a newer release unattended, inside this unit's slot: satellite N at
+#               window_start + (N-1)*slot_minutes, the router one slot after the last satellite.
+#               Off in the image; turn it on per unit (kept across upgrades with the rest of /etc/config).
+# base_url      release.sh bakes the build's release server in here
+config ota 'main'
+	option enabled '1'
+	option auto_install '0'
+	option base_url 'https://ujjain.today/neon-mesh'
+	option channel 'stable'
+	option window_start '03:00'
+	option slot_minutes '20'
+	option check_hours '6'

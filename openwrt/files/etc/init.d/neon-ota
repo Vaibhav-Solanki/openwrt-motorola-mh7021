@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# neon-ota at boot: keep the crond entry in step with neon_ota.main.enabled, and on the first boot after
+# an OTA flash record whether it took (/etc/neon/ota-last). The work is in /usr/sbin/neon-ota.
+START=99
+
+boot() {
+	/usr/sbin/neon-ota boot
+}
+
+start() {
+	/usr/sbin/neon-ota boot
+}
+
+reload() {
+	/usr/sbin/neon-ota boot
+}
+
+stop() {
+	return 0
+}

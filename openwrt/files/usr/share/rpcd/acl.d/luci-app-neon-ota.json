@@ -1,0 +1,18 @@
+{
+	"luci-app-neon-ota": {
+		"description": "Grant access to neon-mesh OTA firmware updates",
+		"read": {
+			"file": {
+				"/usr/sbin/neon-ota status --json": [ "exec" ],
+				"/usr/sbin/neon-ota check --json": [ "exec" ]
+			},
+			"uci": [ "neon_ota" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/neon-ota upgrade --yes --detach --json": [ "exec" ]
+			},
+			"uci": [ "neon_ota" ]
+		}
+	}
+}
